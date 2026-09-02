@@ -1,0 +1,138 @@
+﻿package magnetar:model-component-graph@1.0.0;
+
+/// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
+/// a Model Component calls these operations to incrementally describe an
+/// ExecutionGraph; the Runtime owns the resulting graph value, its
+/// validation, and every identity/reference the Component uses to build it.
+interface graph-builder {
+  /// Portable per-node attribute value. Mirrors `magnetar-runtime`'s
+  /// `OperatorAttributeValue` exactly (Boolean/Integer/Float/String/DType/
+  /// Layout) -- not `compute.wit`'s broader `operation-attribute` shape,
+  /// since a graph-builder node attribute never carries a full nested
+  /// tensor shape or axis list.
+  variant attribute-value {
+    boolean(bool),
+    integer(s64),
+    float-value(f64),
+    text(string),
+  }
+
+  record attribute {
+    name: string,
+    value: attribute-value,
+  }
+
+  /// Which phase this graph is being built for. Matches
+  /// `execution-graph`'s `Prefill And Decode Graphs` requirement -- the
+  /// Capability only supports these two for graph-builder-produced graphs;
+  /// every other `ExecutionGraphPhase` variant remains Runtime-internal.
+  enum graph-phase {
+    prefill,
+    decode,
+  }
+
+  enum kv-cache-role {
+    k,
+    v,
+  }
+
+  /// KV involvement for one graph node's output edge. `resource` is always
+  /// a Runtime-issued identity from `kv-resource` -- never a
+  /// Component-invented string (Requirement "Graph Builder KV Logical
+  /// Resources").
+  record kv-involvement {
+    resource-id: string,
+    role: kv-cache-role,
+    append: bool,
+  }
+
+  /// A tensor's shape, dimensions in order. Deliberately narrower than
+  /// `magnetar-runtime`'s full `TensorDescriptor` (dtype/layout/view/
+  /// affinity/...) for this first, minimal Component: every tensor this
+  /// Capability's graphs carry today is a contiguous `float32` value, the
+  /// same simplification the existing Rust-synthesized Qwen fixture graph
+  /// already makes. Extending this to a real portable dtype/layout choice
+  /// is real follow-up work once a Component genuinely needs one, not a
+  /// completed generality this record only pretends to have.
+  record tensor-shape {
+    dimensions: list<u64>,
+  }
+
+  /// Begins building a graph. Must be the first call; only one graph may
+  /// be under construction per Component instance at a time. A Component
+  /// that violates a graph-builder invariant (calls this twice without an
+  /// intervening `finish-graph`, references an edge id that does not
+  /// exist, names a weight/KV identity the Runtime does not recognize, ...)
+  /// gets a trapped host call, not a recoverable `result` -- these are all
+  /// "the Component is not behaving as this contract requires" conditions,
+  /// the same fail-closed posture this crate already uses for every other
+  /// Provider/Kernel boundary violation. A well-behaved Component never
+  /// triggers one.
+  begin-graph: func(phase: graph-phase, sequence-length: u64, position-offset: u64);
+
+  /// Declares one graph input edge (e.g. "input.token_ids"), returning the
+  /// edge id the Component uses to reference it as a node input. `shape` is
+  /// Component-supplied (Requirement "Graph Builder Tensor Descriptors and
+  /// Weight References": the Component, which knows the architecture,
+  /// supplies the descriptor; the Runtime's job is to validate it, not
+  /// invent it from Runtime-side knowledge of the architecture it must not
+  /// have).
+  declare-input: func(name: string, shape: tensor-shape) -> string;
+
+  /// Resolves a logical weight name (e.g. "layer3.q_proj",
+  /// "token_embedding") against the active Model Instance's already-
+  /// validated weight resources, returning the edge id to use as a node
+  /// input. The Component never supplies or sees a raw resource id or
+  /// buffer (Requirement "Graph Builder Tensor Descriptors and Weight
+  /// References").
+  weight-edge: func(logical-name: string) -> string;
+
+  /// Declares that `edge-id` (a weight edge from `weight-edge`) may alias
+  /// `target-logical-name`'s weight edge (tied embeddings).
+  alias-weight-edge: func(edge-id: string, target-logical-name: string);
+
+  /// Issues a Runtime-owned KV logical resource identity for `layer`/
+  /// `role`, for use in a subsequent `add-node` call's `kv` argument.
+  kv-resource: func(layer: u64, role: kv-cache-role) -> string;
+
+  /// Adds one graph node: `operator`/`family` name a portable Operator
+  /// identity (never a Provider-specific Kernel name -- Requirement
+  /// "Graph Builder Node and Operator Identity"), `inputs` are edge ids
+  /// already returned by a prior `declare-input`/`weight-edge`/`add-node`
+  /// call, and `kv` is `some` only for a node whose output participates in
+  /// incremental decode. Returns the new node's single output edge id
+  /// (single-output only for now -- matches the Runtime's own current
+  /// production capability; see
+  /// `define-provider-prepared-kernel-execution-contract`'s deferred
+  /// multi-output wiring).
+  add-node: func(
+    node-id: string,
+    operator: string,
+    family: string,
+    attributes: list<attribute>,
+    inputs: list<string>,
+    output-shape: tensor-shape,
+    kv: option<kv-involvement>,
+  ) -> string;
+
+  /// Declares `edge-id` as the graph's output (e.g. "logits"), finalizes
+  /// and validates the graph, and returns an opaque graph handle the
+  /// Runtime uses to look up the real `ExecutionGraph` it built. No further
+  /// calls may target this graph after this one.
+  finish-graph: func(output-edge-id: string) -> string;
+}
+
+/// World a Model Component satisfies to produce graphs through this
+/// Capability instead of a Runtime-internal, model-family-specific
+/// builder (Requirement "Model Component Graph Contract").
+world model-component-graph-producer {
+  import graph-builder;
+
+  /// Builds and returns a prefill-phase graph handle for `sequence-length`
+  /// tokens (`finish-graph`'s return value).
+  export build-prefill-graph: func(sequence-length: u64) -> string;
+
+  /// Builds and returns a decode-phase graph handle, given
+  /// `cached-token-count` prior tokens already committed to KV state.
+  export build-decode-graph: func(cached-token-count: u64) -> string;
+}
