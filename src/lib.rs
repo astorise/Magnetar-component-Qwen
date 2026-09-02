@@ -1,4 +1,4 @@
-﻿//! First real, minimal Qwen Model Component
+//! First real, minimal Qwen Model Component
 //! (`magnetar:model-component-graph@1.0.0`, task 11.4).
 //!
 //! Builds prefill and decode Execution Graphs for the exact fixed
@@ -21,8 +21,8 @@ wit_bindgen::generate!({
 });
 
 use magnetar::model_component_graph::graph_builder::{
-    add_node, alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource,
-    weight_edge, Attribute, AttributeValue, GraphPhase, KvCacheRole, KvInvolvement, TensorShape,
+    Attribute, AttributeValue, GraphPhase, KvCacheRole, KvInvolvement, TensorShape, add_node,
+    alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource, weight_edge,
 };
 
 const HIDDEN_SIZE: u64 = 4;
@@ -49,6 +49,24 @@ fn attr(name: &str, value: AttributeValue) -> Attribute {
     }
 }
 
+/// Maps a per-layer weight to the canonical Model Artifact tensor name
+/// `weight_edge` is called with. The Runtime's `graph-builder` Capability
+/// only ever wraps whatever logical name it is given into an edge id
+/// (`weight.{logical_name}`, generically) -- it has no Qwen-specific
+/// knowledge of `self_attn`/`mlp` naming. Supplying the canonical Model
+/// Artifact name directly here, rather than this Component's own
+/// `layerN.suffix` shorthand, is what lets `magnetar-runtime`'s Model
+/// Loading resolve weight edges by a single, generic prefix strip instead
+/// of carrying a Qwen-specific suffix-mapping table itself.
+fn weight_tensor_name(layer: u64, suffix: &str) -> String {
+    match suffix {
+        "input_norm" | "post_attn_norm" => format!("layers.{layer}.{suffix}"),
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" => format!("layers.{layer}.self_attn.{suffix}"),
+        "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
+        other => unreachable!("weight_tensor_name: unknown weight suffix '{other}'"),
+    }
+}
+
 /// Builds one pre-norm decoder layer, matching
 /// `magnetar_runtime::qwen_model_component::qwen_build_graph`'s per-layer
 /// node sequence exactly (RMSNorm, QKV matmul, RoPE, attention, output
@@ -59,7 +77,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
     let q_dim = ATTENTION_HEAD_COUNT * HEAD_DIMENSION;
     let kv_dim = KV_HEAD_COUNT * HEAD_DIMENSION;
 
-    let input_norm_weight = weight_edge(&format!("{prefix}.input_norm"));
+    let input_norm_weight = weight_edge(&weight_tensor_name(layer, "input_norm"));
     let normed = add_node(
         &format!("{prefix}.input_norm"),
         "rmsnorm",
@@ -70,7 +88,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         None,
     );
 
-    let q_weight = weight_edge(&format!("{prefix}.q_proj"));
+    let q_weight = weight_edge(&weight_tensor_name(layer, "q_proj"));
     let q = add_node(
         &format!("{prefix}.q_proj"),
         "matmul",
@@ -80,7 +98,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &shape(vec![sequence_length, q_dim]),
         None,
     );
-    let k_weight = weight_edge(&format!("{prefix}.k_proj"));
+    let k_weight = weight_edge(&weight_tensor_name(layer, "k_proj"));
     let k = add_node(
         &format!("{prefix}.k_proj"),
         "matmul",
@@ -90,7 +108,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &shape(vec![sequence_length, kv_dim]),
         None,
     );
-    let v_weight = weight_edge(&format!("{prefix}.v_proj"));
+    let v_weight = weight_edge(&weight_tensor_name(layer, "v_proj"));
     let v_kv = kv_resource(layer, KvCacheRole::V);
     let v = add_node(
         &format!("{prefix}.v_proj"),
@@ -169,7 +187,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         None,
     );
 
-    let o_weight = weight_edge(&format!("{prefix}.o_proj"));
+    let o_weight = weight_edge(&weight_tensor_name(layer, "o_proj"));
     let attn_proj = add_node(
         &format!("{prefix}.o_proj"),
         "matmul",
@@ -190,7 +208,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         None,
     );
 
-    let post_attn_norm_weight = weight_edge(&format!("{prefix}.post_attn_norm"));
+    let post_attn_norm_weight = weight_edge(&weight_tensor_name(layer, "post_attn_norm"));
     let mlp_normed = add_node(
         &format!("{prefix}.post_attn_norm"),
         "rmsnorm",
@@ -201,7 +219,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         None,
     );
 
-    let gate_weight = weight_edge(&format!("{prefix}.gate_proj"));
+    let gate_weight = weight_edge(&weight_tensor_name(layer, "gate_proj"));
     let gate = add_node(
         &format!("{prefix}.gate_proj"),
         "matmul",
@@ -211,7 +229,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
         None,
     );
-    let up_weight = weight_edge(&format!("{prefix}.up_proj"));
+    let up_weight = weight_edge(&weight_tensor_name(layer, "up_proj"));
     let up = add_node(
         &format!("{prefix}.up_proj"),
         "matmul",
@@ -239,7 +257,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
         None,
     );
-    let down_weight = weight_edge(&format!("{prefix}.down_proj"));
+    let down_weight = weight_edge(&weight_tensor_name(layer, "down_proj"));
     let mlp_out = add_node(
         &format!("{prefix}.down_proj"),
         "matmul",
@@ -261,7 +279,12 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
     )
 }
 
-fn build_graph(phase: GraphPhase, sequence_length: u64, position_offset: u64, kv_append: bool) -> String {
+fn build_graph(
+    phase: GraphPhase,
+    sequence_length: u64,
+    position_offset: u64,
+    kv_append: bool,
+) -> String {
     begin_graph(phase, sequence_length, position_offset);
 
     let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
@@ -321,4 +344,3 @@ impl Guest for Component {
 }
 
 export!(Component);
-
