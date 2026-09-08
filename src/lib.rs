@@ -124,7 +124,17 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         }),
     );
 
-    let rope_attrs = |offset: i64| {
+    // `head_count`: the number of independently-rotated head blocks this
+    // row's columns divide into (`make-first-native-cuda-hot-path-device-
+    // resident`'s `operator`/`operator-scope` deltas in the main Magnetar
+    // repository) -- explicit graph data, matching
+    // `magnetar_runtime::qwen_model_component::qwen_build_graph`'s own Q =
+    // `ATTENTION_HEAD_COUNT` / K = `KV_HEAD_COUNT` split exactly, so a
+    // grouped-query/multi-query configuration (`KV_HEAD_COUNT <
+    // ATTENTION_HEAD_COUNT`) rotates each projection's own head width
+    // correctly instead of the Runtime having to infer it from `rope_q`/
+    // `rope_k`'s node id suffix.
+    let rope_attrs = |offset: i64, head_count: u64| {
         vec![
             attr("base", AttributeValue::FloatValue(ROPE_BASE)),
             attr("dimension", AttributeValue::Integer(ROPE_DIMENSION)),
@@ -133,13 +143,14 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
                 AttributeValue::Text(ROPE_POSITION_MODE.to_string()),
             ),
             attr("position_offset", AttributeValue::Integer(offset)),
+            attr("head_count", AttributeValue::Integer(head_count as i64)),
         ]
     };
     let q_rope = add_node(
         &format!("{prefix}.rope_q"),
         "rope",
         "PositionEncoding",
-        &rope_attrs(0),
+        &rope_attrs(0, ATTENTION_HEAD_COUNT),
         &[q],
         &shape(vec![sequence_length, q_dim]),
         None,
@@ -149,7 +160,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &format!("{prefix}.rope_k"),
         "rope",
         "PositionEncoding",
-        &rope_attrs(0),
+        &rope_attrs(0, KV_HEAD_COUNT),
         &[k],
         &shape(vec![sequence_length, kv_dim]),
         Some(&KvInvolvement {
