@@ -53,7 +53,9 @@ fn attr(name: &str, value: AttributeValue) -> Attribute {
 fn weight_tensor_name(layer: u64, suffix: &str) -> String {
     match suffix {
         "input_norm" | "post_attn_norm" => format!("layers.{layer}.{suffix}"),
-        "q_proj" | "k_proj" | "v_proj" | "o_proj" => format!("layers.{layer}.self_attn.{suffix}"),
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_bias" | "k_bias" | "v_bias" => {
+            format!("layers.{layer}.self_attn.{suffix}")
+        }
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
         other => unreachable!("weight_tensor_name: unknown weight suffix '{other}'"),
     }
@@ -97,6 +99,15 @@ fn build_layer(
         None,
     );
 
+    // Real Qwen2/2.5 checkpoints declare an additive bias term for
+    // q/k/v_proj (an architectural default, not `config.json`-driven --
+    // see `ArchitectureConfig::attention-bias`'s WIT doc comment); o_proj
+    // and every MLP/lm_head projection never carry one in this baseline.
+    // Bias, when present, is added to the raw projection output *before*
+    // RoPE/KV caching -- the cached/rotated value is the biased one, the
+    // real Qwen2 semantics -- so a bias-add node's output (not the
+    // matmul's) becomes `q`/`k`/`v` below, and the v-projection's KV
+    // involvement attaches to whichever node is actually last.
     let q_weight = weight_edge(&weight_tensor_name(layer, "q_proj"));
     let q = add_node(
         &format!("{prefix}.q_proj"),
@@ -107,6 +118,20 @@ fn build_layer(
         &shape(vec![sequence_length, q_dim]),
         None,
     );
+    let q = if config.attention_bias {
+        let q_bias = weight_edge(&weight_tensor_name(layer, "q_bias"));
+        add_node(
+            &format!("{prefix}.q_bias"),
+            "add",
+            "Tensor",
+            &[],
+            &[q, q_bias],
+            &shape(vec![sequence_length, q_dim]),
+            None,
+        )
+    } else {
+        q
+    };
     let k_weight = weight_edge(&weight_tensor_name(layer, "k_proj"));
     let k = add_node(
         &format!("{prefix}.k_proj"),
@@ -117,8 +142,27 @@ fn build_layer(
         &shape(vec![sequence_length, kv_dim]),
         None,
     );
+    let k = if config.attention_bias {
+        let k_bias = weight_edge(&weight_tensor_name(layer, "k_bias"));
+        add_node(
+            &format!("{prefix}.k_bias"),
+            "add",
+            "Tensor",
+            &[],
+            &[k, k_bias],
+            &shape(vec![sequence_length, kv_dim]),
+            None,
+        )
+    } else {
+        k
+    };
     let v_weight = weight_edge(&weight_tensor_name(layer, "v_proj"));
     let v_kv = kv_resource(layer, KvCacheRole::V);
+    let v_kv_involvement = KvInvolvement {
+        resource_id: v_kv,
+        role: KvCacheRole::V,
+        append: kv_append,
+    };
     let v = add_node(
         &format!("{prefix}.v_proj"),
         "matmul",
@@ -126,12 +170,26 @@ fn build_layer(
         &[],
         &[normed, v_weight],
         &shape(vec![sequence_length, kv_dim]),
-        Some(&KvInvolvement {
-            resource_id: v_kv,
-            role: KvCacheRole::V,
-            append: kv_append,
-        }),
+        if config.attention_bias {
+            None
+        } else {
+            Some(&v_kv_involvement)
+        },
     );
+    let v = if config.attention_bias {
+        let v_bias = weight_edge(&weight_tensor_name(layer, "v_bias"));
+        add_node(
+            &format!("{prefix}.v_bias"),
+            "add",
+            "Tensor",
+            &[],
+            &[v, v_bias],
+            &shape(vec![sequence_length, kv_dim]),
+            Some(&v_kv_involvement),
+        )
+    } else {
+        v
+    };
 
     // `head_count`: the number of independently-rotated head blocks this
     // row's columns divide into (`make-first-native-cuda-hot-path-device-

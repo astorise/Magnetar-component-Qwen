@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.1.0;
+package magnetar:model-component-graph@1.2.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -148,6 +148,16 @@ interface model-config {
     rope-theta: f64,
     rope-scaling-factor: option<f64>,
     tie-word-embeddings: bool,
+    /// Whether `self-attn.{q,k,v}-proj` carry an additive bias term -- a
+    /// real Qwen2/2.5 architectural default, not config.json-declared.
+    /// Added in `1.2.0`: source-additive (a Component's own graph-building
+    /// logic need not read this field), but `architecture-config`'s
+    /// structural shape changed, so any checked-in *compiled* Component
+    /// binary that imports `model-config` must be rebuilt against `1.2.0`
+    /// to link -- a `1.1.0`-compiled binary will fail component
+    /// instantiation against a `1.2.0` host (a clean, fail-closed link
+    /// error), not silently misread this field.
+    attention-bias: bool,
   }
 
   /// Returns the Runtime-authorized architecture configuration bound to
