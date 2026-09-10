@@ -1,19 +1,21 @@
-//! First real, minimal Qwen Model Component
-//! (`magnetar:model-component-graph@1.0.0`, task 11.4).
+//! Production, configurable Qwen Model Component
+//! (`magnetar:model-component-graph@1.1.0`,
+//! `implement-production-qwen-model-loading` task group 8).
 //!
-//! Builds prefill and decode Execution Graphs for the exact fixed
-//! architecture Magnetar's own E2E first-native fixture uses
-//! (`magnetar-runtime::first_native_runtime::e2e_fixture_config`), via the
-//! Runtime-owned `graph-builder` Capability rather than by constructing an
-//! `ExecutionGraph` directly -- this Component never touches
-//! `magnetar-runtime`'s Rust types at all, only the WIT contract.
+//! Builds prefill and decode Execution Graphs for whatever Qwen-compatible
+//! architecture the active Model Instance was loaded with, via the
+//! Runtime-owned `graph-builder` and `model-config` Capabilities -- this
+//! Component never touches `magnetar-runtime`'s Rust types at all, only the
+//! WIT contract.
 //!
-//! Deliberately minimal, not general: the architecture dimensions below are
-//! this one fixture's exact values, hard-coded, not read from any
-//! configuration input (this contract has no such input yet). A Component
-//! for a real, configurable Qwen checkpoint is real follow-up work; this is
-//! the first proof that a Component can produce a real graph through this
-//! contract at all.
+//! Architecture dimensions (hidden size, layer count, head counts, head
+//! dimension, vocabulary size, RMSNorm epsilon, RoPE parameters, tied
+//! embeddings) are queried from `model-config` at the start of each
+//! `build-prefill-graph`/`build-decode-graph` call, not compiled-in
+//! constants: the same Component binary produces a configuration-correct
+//! graph for any compatible Qwen checkpoint the Runtime has bound
+//! configuration for (Decision 7 -- "Qwen weight names and shapes become
+//! configuration-derived").
 
 wit_bindgen::generate!({
     path: "wit/model-component-graph.wit",
@@ -24,19 +26,9 @@ use magnetar::model_component_graph::graph_builder::{
     Attribute, AttributeValue, GraphPhase, KvCacheRole, KvInvolvement, TensorShape, add_node,
     alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource, weight_edge,
 };
+use magnetar::model_component_graph::model_config::{self, ArchitectureConfig};
 
-const HIDDEN_SIZE: u64 = 4;
-const LAYER_COUNT: u64 = 1;
-const ATTENTION_HEAD_COUNT: u64 = 2;
-const KV_HEAD_COUNT: u64 = 2;
-const HEAD_DIMENSION: u64 = 2;
-const INTERMEDIATE_SIZE: u64 = 8;
-const VOCABULARY_SIZE: u64 = 258;
-const RMSNORM_EPSILON: f64 = 1e-6;
-const ROPE_BASE: f64 = 10_000.0;
-const ROPE_DIMENSION: i64 = HEAD_DIMENSION as i64;
 const ROPE_POSITION_MODE: &str = "sequential";
-const TIED_EMBEDDINGS: bool = true;
 
 fn shape(dimensions: Vec<u64>) -> TensorShape {
     TensorShape { dimensions }
@@ -72,19 +64,36 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
 /// node sequence exactly (RMSNorm, QKV matmul, RoPE, attention, output
 /// projection, residual-add, RMSNorm, gated MLP, residual-add), through
 /// `graph-builder` calls instead of direct `ExecutionGraph` construction.
-fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: bool) -> String {
+/// Every dimension comes from `config`, queried once per
+/// `build-prefill-graph`/`build-decode-graph` call -- not a compiled-in
+/// constant.
+fn build_layer(
+    config: &ArchitectureConfig,
+    layer: u64,
+    residual_in: &str,
+    sequence_length: u64,
+    kv_append: bool,
+) -> String {
     let prefix = format!("layer{layer}");
-    let q_dim = ATTENTION_HEAD_COUNT * HEAD_DIMENSION;
-    let kv_dim = KV_HEAD_COUNT * HEAD_DIMENSION;
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
+    let attention_head_count = config.num_attention_heads as u64;
+    let kv_head_count = config.num_key_value_heads as u64;
+    let head_dimension = config.head_dimension;
+    let q_dim = attention_head_count * head_dimension;
+    let kv_dim = kv_head_count * head_dimension;
 
     let input_norm_weight = weight_edge(&weight_tensor_name(layer, "input_norm"));
     let normed = add_node(
         &format!("{prefix}.input_norm"),
         "rmsnorm",
         "Normalization",
-        &[attr("epsilon", AttributeValue::FloatValue(RMSNORM_EPSILON))],
+        &[attr(
+            "epsilon",
+            AttributeValue::FloatValue(config.rms_norm_eps),
+        )],
         &[residual_in.to_string(), input_norm_weight],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     );
 
@@ -129,15 +138,15 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
     // resident`'s `operator`/`operator-scope` deltas in the main Magnetar
     // repository) -- explicit graph data, matching
     // `magnetar_runtime::qwen_model_component::qwen_build_graph`'s own Q =
-    // `ATTENTION_HEAD_COUNT` / K = `KV_HEAD_COUNT` split exactly, so a
-    // grouped-query/multi-query configuration (`KV_HEAD_COUNT <
-    // ATTENTION_HEAD_COUNT`) rotates each projection's own head width
+    // `attention_head_count` / K = `kv_head_count` split exactly, so a
+    // grouped-query/multi-query configuration (`kv_head_count <
+    // attention_head_count`) rotates each projection's own head width
     // correctly instead of the Runtime having to infer it from `rope_q`/
     // `rope_k`'s node id suffix.
     let rope_attrs = |offset: i64, head_count: u64| {
         vec![
-            attr("base", AttributeValue::FloatValue(ROPE_BASE)),
-            attr("dimension", AttributeValue::Integer(ROPE_DIMENSION)),
+            attr("base", AttributeValue::FloatValue(config.rope_theta)),
+            attr("dimension", AttributeValue::Integer(head_dimension as i64)),
             attr(
                 "position_mode",
                 AttributeValue::Text(ROPE_POSITION_MODE.to_string()),
@@ -150,7 +159,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &format!("{prefix}.rope_q"),
         "rope",
         "PositionEncoding",
-        &rope_attrs(0, ATTENTION_HEAD_COUNT),
+        &rope_attrs(0, attention_head_count),
         &[q],
         &shape(vec![sequence_length, q_dim]),
         None,
@@ -160,7 +169,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &format!("{prefix}.rope_k"),
         "rope",
         "PositionEncoding",
-        &rope_attrs(0, KV_HEAD_COUNT),
+        &rope_attrs(0, kv_head_count),
         &[k],
         &shape(vec![sequence_length, kv_dim]),
         Some(&KvInvolvement {
@@ -178,15 +187,15 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
             attr("causal", AttributeValue::Boolean(true)),
             attr(
                 "head_count",
-                AttributeValue::Integer(ATTENTION_HEAD_COUNT as i64),
+                AttributeValue::Integer(attention_head_count as i64),
             ),
             attr(
                 "kv_head_count",
-                AttributeValue::Integer(KV_HEAD_COUNT as i64),
+                AttributeValue::Integer(kv_head_count as i64),
             ),
             attr(
                 "head_dimension",
-                AttributeValue::Integer(HEAD_DIMENSION as i64),
+                AttributeValue::Integer(head_dimension as i64),
             ),
             attr(
                 "attention_mask_kind",
@@ -205,7 +214,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "LinearAlgebra",
         &[],
         &[attn_out, o_weight],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     );
 
@@ -215,7 +224,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "Tensor",
         &[],
         &[residual_in.to_string(), attn_proj],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     );
 
@@ -224,9 +233,12 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         &format!("{prefix}.post_attn_norm"),
         "rmsnorm",
         "Normalization",
-        &[attr("epsilon", AttributeValue::FloatValue(RMSNORM_EPSILON))],
+        &[attr(
+            "epsilon",
+            AttributeValue::FloatValue(config.rms_norm_eps),
+        )],
         &[post_attn.clone(), post_attn_norm_weight],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     );
 
@@ -237,7 +249,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "LinearAlgebra",
         &[],
         &[mlp_normed.clone(), gate_weight],
-        &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
+        &shape(vec![sequence_length, intermediate_size]),
         None,
     );
     let up_weight = weight_edge(&weight_tensor_name(layer, "up_proj"));
@@ -247,7 +259,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "LinearAlgebra",
         &[],
         &[mlp_normed, up_weight],
-        &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
+        &shape(vec![sequence_length, intermediate_size]),
         None,
     );
     let activated = add_node(
@@ -256,7 +268,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "Activation",
         &[],
         &[gate],
-        &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
+        &shape(vec![sequence_length, intermediate_size]),
         None,
     );
     let mlp_hidden = add_node(
@@ -265,7 +277,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "Tensor",
         &[],
         &[activated, up],
-        &shape(vec![sequence_length, INTERMEDIATE_SIZE]),
+        &shape(vec![sequence_length, intermediate_size]),
         None,
     );
     let down_weight = weight_edge(&weight_tensor_name(layer, "down_proj"));
@@ -275,7 +287,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "LinearAlgebra",
         &[],
         &[mlp_hidden, down_weight],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     );
 
@@ -285,7 +297,7 @@ fn build_layer(layer: u64, residual_in: &str, sequence_length: u64, kv_append: b
         "Tensor",
         &[],
         &[post_attn, mlp_out],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, hidden_size]),
         None,
     )
 }
@@ -296,6 +308,7 @@ fn build_graph(
     position_offset: u64,
     kv_append: bool,
 ) -> String {
+    let config = model_config::model_config();
     begin_graph(phase, sequence_length, position_offset);
 
     let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
@@ -306,12 +319,12 @@ fn build_graph(
         "Tensor",
         &[],
         &[token_ids, token_embedding],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, config.hidden_size]),
         None,
     );
 
-    for layer in 0..LAYER_COUNT {
-        hidden = build_layer(layer, &hidden, sequence_length, kv_append);
+    for layer in 0..config.num_hidden_layers as u64 {
+        hidden = build_layer(&config, layer, &hidden, sequence_length, kv_append);
     }
 
     let final_norm_weight = weight_edge("final_norm");
@@ -319,14 +332,17 @@ fn build_graph(
         "final_norm",
         "rmsnorm",
         "Normalization",
-        &[attr("epsilon", AttributeValue::FloatValue(RMSNORM_EPSILON))],
+        &[attr(
+            "epsilon",
+            AttributeValue::FloatValue(config.rms_norm_eps),
+        )],
         &[hidden, final_norm_weight],
-        &shape(vec![sequence_length, HIDDEN_SIZE]),
+        &shape(vec![sequence_length, config.hidden_size]),
         None,
     );
 
     let lm_head_weight = weight_edge("lm_head");
-    if TIED_EMBEDDINGS {
+    if config.tie_word_embeddings {
         alias_weight_edge(&lm_head_weight, "token_embedding");
     }
     let logits = add_node(
@@ -335,7 +351,7 @@ fn build_graph(
         "LinearAlgebra",
         &[],
         &[hidden_final, lm_head_weight],
-        &shape(vec![sequence_length, VOCABULARY_SIZE]),
+        &shape(vec![sequence_length, config.vocabulary_size]),
         None,
     );
 

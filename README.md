@@ -12,31 +12,38 @@ not Providers or Devices).
 
 ## Status
 
-**Real, minimal implementation.** `src/lib.rs` builds prefill and decode
-Execution Graphs through `magnetar:model-component-graph@1.0.0`'s
-`graph-builder` Capability (vendored under `wit/`), using
-`wit-bindgen`-generated bindings -- this crate never depends on
-`magnetar-runtime`'s Rust types, only the WIT contract. Compiles to a real
-Component via `cargo build --target wasm32-unknown-unknown --release`
-followed by `wasm-tools component new`, and has been verified end to end
-against a real `GraphBuilderCapability` (a real, correctly-shaped
-`ExecutionGraph`, correct tied-embeddings weight aliasing, correct KV
-cache metadata) -- see `magnetar-runtime`'s
-`component_wasmtime::tests::wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_capability`.
+**Real, configurable, production implementation.** `src/lib.rs` builds
+prefill and decode Execution Graphs through
+`magnetar:model-component-graph@1.1.0`'s `graph-builder` and `model-config`
+Capabilities (vendored under `wit/`), using `wit-bindgen`-generated
+bindings -- this crate never depends on `magnetar-runtime`'s Rust types,
+only the WIT contract. Compiles to a real Component via
+`cargo build --target wasm32-unknown-unknown --release` followed by
+`wasm-tools component new`, and has been verified end to end against a
+real `GraphBuilderCapability`/`ModelConfigCapability` (a real,
+correctly-shaped `ExecutionGraph`, correct tied-embeddings weight
+aliasing, correct KV cache metadata) -- see `magnetar-runtime`'s
+`component_wasmtime::tests::wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_capability`
+and `first_native_runtime::tests::real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shaped_config`
+(the latter proving a materially different, grouped-query-shaped
+configuration -- distinct attention/KV head counts -- produces a correct
+graph through this same compiled binary, not only the canonical tiny E2E
+fixture dimensions), plus real CUDA hardware evidence in the main
+repository's `integration-tests/cuda-first-native`.
 
-Deliberately minimal, not general: the architecture dimensions (hidden
-size, layer count, head counts, vocabulary size, tied embeddings, ...) are
-hard-coded to match `magnetar-runtime`'s own E2E first-native fixture
-exactly, since this contract has no architecture-configuration mechanism
-yet. A Component for a real, configurable checkpoint -- reading weight
-shapes and hyperparameters from an actual Model Artifact rather than
-Rust constants -- is real follow-up work, tracked as
-`reach-architecture-freeze-1` task group 12 (moving Qwen weight-name and
-KV-name mappings, and eventually all Qwen-specific semantics, out of
-`magnetar-runtime`'s generic Core). This Component is also not yet wired
-into `magnetar-runtime`'s production generation path (task 11.5) -- today
-it is proven correct in isolation, not yet load-bearing for real
-inference.
+`1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
+Component checkpoint-configurable: architecture dimensions (hidden size,
+layer count, attention/KV head counts, head dimension, intermediate size,
+vocabulary size, RMSNorm epsilon, RoPE parameters, tied embeddings) are no
+longer compiled-in Rust constants -- every `build-prefill-graph`/
+`build-decode-graph` call queries them fresh from `model-config`, so the
+same compiled Component binary produces a configuration-correct graph for
+any compatible Qwen checkpoint the Runtime has bound configuration for,
+including a decoder stack whose layer count is read from the bound
+configuration rather than fixed at compile time. It is wired into
+`magnetar-runtime`'s production generation path (task 11.5 in the earlier
+`reach-architecture-freeze-1` change) as the exclusive strict first-native
+graph source.
 
 ## Governing contract
 

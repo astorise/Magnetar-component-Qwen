@@ -1,4 +1,4 @@
-﻿package magnetar:model-component-graph@1.0.0;
+package magnetar:model-component-graph@1.1.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -122,11 +122,49 @@ interface graph-builder {
   finish-graph: func(output-edge-id: string) -> string;
 }
 
+/// Runtime-owned Capability exposing normalized, Runtime-authorized model
+/// architecture configuration bound to the active Model Instance
+/// (`implement-production-qwen-model-loading` Decision 6). A configurable
+/// Model Component queries this to derive weight names/shapes and graph
+/// structure instead of hard-coding fixture-specific dimensions. Added in
+/// `1.1.0` alongside the unchanged `graph-builder` interface -- a Component
+/// compiled against `1.0.0` (importing only `graph-builder`) remains valid;
+/// this is a purely additive evolution.
+interface model-config {
+  /// Runtime-authorized normalized model architecture configuration.
+  /// Deliberately narrow: only the specific architecture-shaped values a
+  /// Component needs to produce a production-shaped graph -- never raw
+  /// JSON, arbitrary annotation maps, a file path, raw weight bytes, or
+  /// Provider/Device identity.
+  record architecture-config {
+    hidden-size: u64,
+    intermediate-size: u64,
+    num-hidden-layers: u32,
+    num-attention-heads: u32,
+    num-key-value-heads: u32,
+    head-dimension: u64,
+    vocabulary-size: u64,
+    rms-norm-eps: f64,
+    rope-theta: f64,
+    rope-scaling-factor: option<f64>,
+    tie-word-embeddings: bool,
+  }
+
+  /// Returns the Runtime-authorized architecture configuration bound to
+  /// the active Model Instance for this graph-building session. Traps if
+  /// none is bound -- the Runtime never fabricates a configuration for a
+  /// Component that has no real ingested one (Decision 6's fail-closed
+  /// posture, matching `graph-builder`'s own "a well-behaved Component
+  /// never triggers one").
+  model-config: func() -> architecture-config;
+}
+
 /// World a Model Component satisfies to produce graphs through this
 /// Capability instead of a Runtime-internal, model-family-specific
 /// builder (Requirement "Model Component Graph Contract").
 world model-component-graph-producer {
   import graph-builder;
+  import model-config;
 
   /// Builds and returns a prefill-phase graph handle for `sequence-length`
   /// tokens (`finish-graph`'s return value).
