@@ -432,6 +432,16 @@ fn build_graph_segment(
 
         let lm_head_weight = weight_edge("lm_head");
         if config.tie_word_embeddings {
+            // `alias-weight-edge`'s host implementation requires its target
+            // edge to already exist in this graph. A segment ending at
+            // `num_hidden_layers` but NOT starting at layer 0 (multi-device
+            // pipeline placement) never otherwise calls
+            // `weight-edge("token_embedding")` -- that embedding lookup
+            // lives in an earlier segment's own graph -- so register it
+            // here too before aliasing. Idempotent with the embedding
+            // branch's own call above when both run in the same
+            // (unsegmented) graph.
+            weight_edge("token_embedding");
             alias_weight_edge(&lm_head_weight, "token_embedding");
         }
         let logits = add_node(
