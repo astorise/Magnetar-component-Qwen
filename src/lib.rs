@@ -360,60 +360,111 @@ fn build_layer(
     )
 }
 
+/// Builds one *segment* of the full decoder stack's graph -- real decoder
+/// layers `[start_layer, end_layer)` only (`add-real-multi-device-model-
+/// instance-placement`). `build_graph` (below) is now exactly
+/// `build_graph_segment(..., 0, config.num_hidden_layers)` -- source-
+/// identical, not merely output-equivalent, so the existing, already-
+/// verified full-graph behavior cannot silently drift from this segment
+/// path.
+///
+/// `start_layer == 0` begins from a declared `token_ids` input with the
+/// real token embedding lookup, exactly as the full graph always has.
+/// `start_layer > 0` begins from a declared `hidden_states_in` input of
+/// shape `[sequence_length, hidden_size]` instead -- a prior segment's
+/// own real output, for a caller to have moved here explicitly (this
+/// Component never assumes how; that is Runtime-side, real
+/// `multi-device-placement` cross-Device movement).
+///
+/// `end_layer == config.num_hidden_layers` ends with the real
+/// final-norm/lm-head projection, exactly as the full graph always has.
+/// `end_layer < config.num_hidden_layers` ends with the raw post-layer
+/// hidden state as this graph's own declared output instead, for a
+/// subsequent segment to consume as its own `hidden_states_in`.
+fn build_graph_segment(
+    phase: GraphPhase,
+    sequence_length: u64,
+    position_offset: u64,
+    kv_append: bool,
+    start_layer: u32,
+    end_layer: u32,
+) -> String {
+    let config = model_config::model_config();
+    begin_graph(phase, sequence_length, position_offset);
+
+    let mut hidden = if start_layer == 0 {
+        let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
+        let token_embedding = weight_edge("token_embedding");
+        add_node(
+            "embedding",
+            "embedding",
+            "Tensor",
+            &[],
+            &[token_ids, token_embedding],
+            &shape(vec![sequence_length, config.hidden_size]),
+            None,
+        )
+    } else {
+        declare_input(
+            "hidden_states_in",
+            &shape(vec![sequence_length, config.hidden_size]),
+        )
+    };
+
+    for layer in start_layer as u64..end_layer as u64 {
+        hidden = build_layer(&config, layer, &hidden, sequence_length, kv_append);
+    }
+
+    if end_layer == config.num_hidden_layers {
+        let final_norm_weight = weight_edge("final_norm");
+        let hidden_final = add_node(
+            "final_norm",
+            "rmsnorm",
+            "Normalization",
+            &[attr(
+                "epsilon",
+                AttributeValue::FloatValue(config.rms_norm_eps),
+            )],
+            &[hidden, final_norm_weight],
+            &shape(vec![sequence_length, config.hidden_size]),
+            None,
+        );
+
+        let lm_head_weight = weight_edge("lm_head");
+        if config.tie_word_embeddings {
+            alias_weight_edge(&lm_head_weight, "token_embedding");
+        }
+        let logits = add_node(
+            "lm_head",
+            "matmul",
+            "LinearAlgebra",
+            &[],
+            &[hidden_final, lm_head_weight],
+            &shape(vec![sequence_length, config.vocabulary_size]),
+            None,
+        );
+
+        finish_graph(&logits)
+    } else {
+        finish_graph(&hidden)
+    }
+}
+
 fn build_graph(
     phase: GraphPhase,
     sequence_length: u64,
     position_offset: u64,
     kv_append: bool,
 ) -> String {
-    let config = model_config::model_config();
-    begin_graph(phase, sequence_length, position_offset);
-
-    let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
-    let token_embedding = weight_edge("token_embedding");
-    let mut hidden = add_node(
-        "embedding",
-        "embedding",
-        "Tensor",
-        &[],
-        &[token_ids, token_embedding],
-        &shape(vec![sequence_length, config.hidden_size]),
-        None,
-    );
-
-    for layer in 0..config.num_hidden_layers as u64 {
-        hidden = build_layer(&config, layer, &hidden, sequence_length, kv_append);
-    }
-
-    let final_norm_weight = weight_edge("final_norm");
-    let hidden_final = add_node(
-        "final_norm",
-        "rmsnorm",
-        "Normalization",
-        &[attr(
-            "epsilon",
-            AttributeValue::FloatValue(config.rms_norm_eps),
-        )],
-        &[hidden, final_norm_weight],
-        &shape(vec![sequence_length, config.hidden_size]),
-        None,
-    );
-
-    let lm_head_weight = weight_edge("lm_head");
-    if config.tie_word_embeddings {
-        alias_weight_edge(&lm_head_weight, "token_embedding");
-    }
-    let logits = add_node(
-        "lm_head",
-        "matmul",
-        "LinearAlgebra",
-        &[],
-        &[hidden_final, lm_head_weight],
-        &shape(vec![sequence_length, config.vocabulary_size]),
-        None,
-    );
-
-    finish_graph(&logits)
+    let num_hidden_layers = model_config::model_config().num_hidden_layers;
+    build_graph_segment(
+        phase,
+        sequence_length,
+        position_offset,
+        kv_append,
+        0,
+        num_hidden_layers,
+    )
 }
 
 struct Component;
@@ -425,6 +476,36 @@ impl Guest for Component {
 
     fn build_decode_graph(cached_token_count: u64) -> String {
         build_graph(GraphPhase::Decode, 1, cached_token_count, true)
+    }
+
+    fn build_prefill_graph_segment(
+        sequence_length: u64,
+        start_layer: u32,
+        end_layer: u32,
+    ) -> String {
+        build_graph_segment(
+            GraphPhase::Prefill,
+            sequence_length,
+            0,
+            false,
+            start_layer,
+            end_layer,
+        )
+    }
+
+    fn build_decode_graph_segment(
+        cached_token_count: u64,
+        start_layer: u32,
+        end_layer: u32,
+    ) -> String {
+        build_graph_segment(
+            GraphPhase::Decode,
+            1,
+            cached_token_count,
+            true,
+            start_layer,
+            end_layer,
+        )
     }
 }
 

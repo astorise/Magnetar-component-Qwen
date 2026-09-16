@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.2.0;
+package magnetar:model-component-graph@1.3.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -183,4 +183,40 @@ world model-component-graph-producer {
   /// Builds and returns a decode-phase graph handle, given
   /// `cached-token-count` prior tokens already committed to KV state.
   export build-decode-graph: func(cached-token-count: u64) -> string;
+
+  /// Added in `1.3.0` (`add-real-multi-device-model-instance-placement`):
+  /// builds one *segment* of the full decoder stack's prefill graph --
+  /// real decoder layers `[start-layer, end-layer)` only, for real
+  /// multi-Device pipeline placement (a caller runs one segment's graph
+  /// on one Device, then another segment's graph on a different Device).
+  /// `build-prefill-graph(sequence-length)` is exactly
+  /// `build-prefill-graph-segment(sequence-length, 0, num-hidden-layers)`
+  /// -- source-identical, not merely output-equivalent.
+  ///
+  /// When `start-layer` is `0`, the segment begins from a declared
+  /// `token_ids` input, including the real token embedding lookup (as
+  /// `build-prefill-graph` does today). Otherwise it begins from a
+  /// declared `hidden_states_in` input of shape `[sequence-length,
+  /// hidden-size]`, carrying a prior segment's own real output.
+  ///
+  /// When `end-layer` equals the active Model Instance's real
+  /// `num-hidden-layers` (from `model-config`), the segment ends with the
+  /// real final-norm/lm-head projection, exactly as
+  /// `build-prefill-graph` does today. Otherwise it ends with the raw
+  /// post-layer hidden state as the graph's own declared output, for a
+  /// subsequent segment to consume as its own `hidden_states_in`.
+  ///
+  /// `0 <= start-layer <= end-layer <= num-hidden-layers` is a real,
+  /// Runtime-validated precondition; a Component that violates it (by
+  /// calling with an inverted or out-of-range pair) traps, matching this
+  /// interface's existing fail-closed posture -- a well-behaved Component
+  /// never triggers one.
+  export build-prefill-graph-segment: func(sequence-length: u64, start-layer: u32, end-layer: u32) -> string;
+
+  /// The decode-phase counterpart of `build-prefill-graph-segment`, with
+  /// the identical segment-boundary semantics.
+  /// `build-decode-graph(cached-token-count)` is exactly
+  /// `build-decode-graph-segment(cached-token-count, 0,
+  /// num-hidden-layers)`.
+  export build-decode-graph-segment: func(cached-token-count: u64, start-layer: u32, end-layer: u32) -> string;
 }
