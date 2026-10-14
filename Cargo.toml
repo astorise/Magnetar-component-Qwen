@@ -4,6 +4,13 @@
 name = "magnetar-component-Qwen"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Qwen model Component (WebAssembly) for the Magnetar inference runtime."
+repository = "https://github.com/astorise/Magnetar-component-Qwen"
+readme = "README.md"
+keywords = ["ai", "inference", "magnetar"]
+categories = ["science", "wasm"]
+rust-version = "1.98"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
