@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-component-Qwen"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "wit-bindgen",
 ]
