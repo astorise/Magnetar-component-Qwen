@@ -29,6 +29,7 @@ use magnetar::model_component_graph::graph_builder::{
 use magnetar::model_component_graph::model_config::{self, ArchitectureConfig};
 
 const ROPE_POSITION_MODE: &str = "sequential";
+const ROPE_ROTATION_PAIRING: &str = "half_split";
 
 fn shape(dimensions: Vec<u64>) -> TensorShape {
     TensorShape { dimensions }
@@ -208,6 +209,13 @@ fn build_layer(
             attr(
                 "position_mode",
                 AttributeValue::Text(ROPE_POSITION_MODE.to_string()),
+            ),
+            // Hugging Face checkpoints rotate (i, i + dimension/2)
+            // (`rotate_half`), not adjacent pairs; declared explicitly so
+            // the Runtime never infers it (`fix-rope-rotation-pairing`).
+            attr(
+                "rotation_pairing",
+                AttributeValue::Text(ROPE_ROTATION_PAIRING.to_string()),
             ),
             attr("position_offset", AttributeValue::Integer(offset)),
             attr("head_count", AttributeValue::Integer(head_count as i64)),
