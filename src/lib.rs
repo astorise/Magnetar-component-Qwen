@@ -35,6 +35,13 @@ fn shape(dimensions: Vec<u64>) -> TensorShape {
     TensorShape { dimensions }
 }
 
+/// How this node may be split across Devices (`tensor_parallel`, see
+/// the Runtime's `operator::TENSOR_PARALLEL_ATTRIBUTE`): `column` and
+/// `row` matmuls, `local` elementwise nodes between them.
+fn tensor_parallel(kind: &str) -> Attribute {
+    attr("tensor_parallel", AttributeValue::Text(kind.to_string()))
+}
+
 fn attr(name: &str, value: AttributeValue) -> Attribute {
     Attribute {
         name: name.to_string(),
@@ -343,7 +350,9 @@ fn build_layer(
     )
 }
 
-/// The dense gated MLP: `down(silu(gate(h)) * up(h))`.
+/// The dense gated MLP: `down(silu(gate(h)) * up(h))`, declared
+/// tensor-parallel: `gate`/`up` by output columns, `silu`/`mul` on each
+/// share, `down` by input rows (partial sums the Runtime's Provider reduces).
 fn dense_mlp(
     prefix: &str,
     layer: u64,
@@ -357,7 +366,7 @@ fn dense_mlp(
         &format!("{prefix}.gate_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("column")],
         &[mlp_normed.clone(), gate_weight],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -367,7 +376,7 @@ fn dense_mlp(
         &format!("{prefix}.up_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("column")],
         &[mlp_normed, up_weight],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -376,7 +385,7 @@ fn dense_mlp(
         &format!("{prefix}.silu"),
         "silu",
         "Activation",
-        &[],
+        &[tensor_parallel("local")],
         &[gate],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -385,7 +394,7 @@ fn dense_mlp(
         &format!("{prefix}.mul"),
         "mul",
         "Tensor",
-        &[],
+        &[tensor_parallel("local")],
         &[activated, up],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -395,7 +404,7 @@ fn dense_mlp(
         &format!("{prefix}.down_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("row")],
         &[mlp_hidden, down_weight],
         &shape(vec![sequence_length, hidden_size]),
         None,
