@@ -424,12 +424,13 @@ fn moe_mlp(
     hidden_size: u64,
 ) -> String {
     let rows = |cols: u64| shape(vec![sequence_length, cols]);
-    let matmul = |name: &str, input: &str, weight: &str, cols: u64| {
+    let matmul = |name: &str, input: &str, weight: &str, cols: u64, parallel: Option<&str>| {
+        let attributes: Vec<Attribute> = parallel.map(tensor_parallel).into_iter().collect();
         add_node(
             &format!("{prefix}.{name}"),
             "matmul",
             "LinearAlgebra",
-            &[],
+            &attributes,
             &[
                 input.to_string(),
                 weight_edge(&weight_tensor_name(layer, weight)),
@@ -438,7 +439,16 @@ fn moe_mlp(
             None,
         )
     };
-    let logits = matmul("router", &mlp_normed, "router_proj", u64::from(moe.experts));
+    // Tensor parallel: the router is replicated (every Device routes over
+    // every expert), the routed experts split whole across Devices, the
+    // shared expert like a dense MLP.
+    let logits = matmul(
+        "router",
+        &mlp_normed,
+        "router_proj",
+        u64::from(moe.experts),
+        None,
+    );
     let routed = add_node(
         &format!("{prefix}.experts"),
         "moe-experts",
@@ -453,6 +463,7 @@ fn moe_mlp(
                 "normalize_top_k",
                 AttributeValue::Boolean(moe.normalize_top_k),
             ),
+            tensor_parallel("experts"),
         ],
         &[
             mlp_normed.clone(),
@@ -472,13 +483,20 @@ fn moe_mlp(
         &mlp_normed,
         "shared_gate_proj",
         shared_size,
+        Some("column"),
     );
-    let up = matmul("shared_up_proj", &mlp_normed, "shared_up_proj", shared_size);
+    let up = matmul(
+        "shared_up_proj",
+        &mlp_normed,
+        "shared_up_proj",
+        shared_size,
+        Some("column"),
+    );
     let activated = add_node(
         &format!("{prefix}.shared_silu"),
         "silu",
         "Activation",
-        &[],
+        &[tensor_parallel("local")],
         &[gate],
         &rows(shared_size),
         None,
@@ -487,13 +505,25 @@ fn moe_mlp(
         &format!("{prefix}.shared_mul"),
         "mul",
         "Tensor",
-        &[],
+        &[tensor_parallel("local")],
         &[activated, up],
         &rows(shared_size),
         None,
     );
-    let shared = matmul("shared_down_proj", &hidden, "shared_down_proj", hidden_size);
-    let gate_logit = matmul("shared_expert_gate", &mlp_normed, "shared_expert_gate", 1);
+    let shared = matmul(
+        "shared_down_proj",
+        &hidden,
+        "shared_down_proj",
+        hidden_size,
+        Some("row"),
+    );
+    let gate_logit = matmul(
+        "shared_expert_gate",
+        &mlp_normed,
+        "shared_expert_gate",
+        1,
+        None,
+    );
     let scale = add_node(
         &format!("{prefix}.shared_expert_scale"),
         "activation",
