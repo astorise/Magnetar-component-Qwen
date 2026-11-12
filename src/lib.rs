@@ -26,13 +26,20 @@ use magnetar::model_component_graph::graph_builder::{
     Attribute, AttributeValue, GraphPhase, KvCacheRole, KvInvolvement, TensorShape, add_node,
     alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource, weight_edge,
 };
-use magnetar::model_component_graph::model_config::{self, ArchitectureConfig};
+use magnetar::model_component_graph::model_config::{self, ArchitectureConfig, MoeConfig};
 
 const ROPE_POSITION_MODE: &str = "sequential";
 const ROPE_ROTATION_PAIRING: &str = "half_split";
 
 fn shape(dimensions: Vec<u64>) -> TensorShape {
     TensorShape { dimensions }
+}
+
+/// How this node may be split across Devices (`tensor_parallel`, see
+/// the Runtime's `operator::TENSOR_PARALLEL_ATTRIBUTE`): `column` and
+/// `row` matmuls, `local` elementwise nodes between them.
+fn tensor_parallel(kind: &str) -> Attribute {
+    attr("tensor_parallel", AttributeValue::Text(kind.to_string()))
 }
 
 fn attr(name: &str, value: AttributeValue) -> Attribute {
@@ -58,6 +65,10 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
             format!("layers.{layer}.self_attn.{suffix}")
         }
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
+        "router_proj" | "experts_gate_proj" | "experts_up_proj" | "experts_down_proj"
+        | "shared_gate_proj" | "shared_up_proj" | "shared_down_proj" | "shared_expert_gate" => {
+            format!("layers.{layer}.moe.{suffix}")
+        }
         other => unreachable!("weight_tensor_name: unknown weight suffix '{other}'"),
     }
 }
@@ -72,6 +83,7 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
 /// constant.
 fn build_layer(
     config: &ArchitectureConfig,
+    moe: Option<&MoeConfig>,
     layer: u64,
     residual_in: &str,
     sequence_length: u64,
@@ -308,12 +320,53 @@ fn build_layer(
         None,
     );
 
+    let mlp_out = match moe {
+        None => dense_mlp(
+            &prefix,
+            layer,
+            mlp_normed,
+            sequence_length,
+            hidden_size,
+            intermediate_size,
+        ),
+        Some(moe) => moe_mlp(
+            &prefix,
+            layer,
+            moe,
+            mlp_normed,
+            sequence_length,
+            hidden_size,
+        ),
+    };
+
+    add_node(
+        &format!("{prefix}.residual2"),
+        "residual-add",
+        "Tensor",
+        &[],
+        &[post_attn, mlp_out],
+        &shape(vec![sequence_length, hidden_size]),
+        None,
+    )
+}
+
+/// The dense gated MLP: `down(silu(gate(h)) * up(h))`, declared
+/// tensor-parallel: `gate`/`up` by output columns, `silu`/`mul` on each
+/// share, `down` by input rows (partial sums the Runtime's Provider reduces).
+fn dense_mlp(
+    prefix: &str,
+    layer: u64,
+    mlp_normed: String,
+    sequence_length: u64,
+    hidden_size: u64,
+    intermediate_size: u64,
+) -> String {
     let gate_weight = weight_edge(&weight_tensor_name(layer, "gate_proj"));
     let gate = add_node(
         &format!("{prefix}.gate_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("column")],
         &[mlp_normed.clone(), gate_weight],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -323,7 +376,7 @@ fn build_layer(
         &format!("{prefix}.up_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("column")],
         &[mlp_normed, up_weight],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -332,7 +385,7 @@ fn build_layer(
         &format!("{prefix}.silu"),
         "silu",
         "Activation",
-        &[],
+        &[tensor_parallel("local")],
         &[gate],
         &shape(vec![sequence_length, intermediate_size]),
         None,
@@ -341,29 +394,161 @@ fn build_layer(
         &format!("{prefix}.mul"),
         "mul",
         "Tensor",
-        &[],
+        &[tensor_parallel("local")],
         &[activated, up],
         &shape(vec![sequence_length, intermediate_size]),
         None,
     );
     let down_weight = weight_edge(&weight_tensor_name(layer, "down_proj"));
-    let mlp_out = add_node(
+    add_node(
         &format!("{prefix}.down_proj"),
         "matmul",
         "LinearAlgebra",
-        &[],
+        &[tensor_parallel("row")],
         &[mlp_hidden, down_weight],
         &shape(vec![sequence_length, hidden_size]),
         None,
-    );
+    )
+}
 
+/// A routed mixture of experts (`execute-and-cache-moe-experts` F02):
+/// `moe-experts(h, matmul(h, router), experts)`, plus, when the checkpoint
+/// has one, the always-active shared expert scaled by
+/// `sigmoid(matmul(h, shared_expert_gate))`.
+fn moe_mlp(
+    prefix: &str,
+    layer: u64,
+    moe: &MoeConfig,
+    mlp_normed: String,
+    sequence_length: u64,
+    hidden_size: u64,
+) -> String {
+    let rows = |cols: u64| shape(vec![sequence_length, cols]);
+    let matmul = |name: &str, input: &str, weight: &str, cols: u64, parallel: Option<&str>| {
+        let attributes: Vec<Attribute> = parallel.map(tensor_parallel).into_iter().collect();
+        add_node(
+            &format!("{prefix}.{name}"),
+            "matmul",
+            "LinearAlgebra",
+            &attributes,
+            &[
+                input.to_string(),
+                weight_edge(&weight_tensor_name(layer, weight)),
+            ],
+            &rows(cols),
+            None,
+        )
+    };
+    // Tensor parallel: the router is replicated (every Device routes over
+    // every expert), the routed experts split whole across Devices, the
+    // shared expert like a dense MLP.
+    let logits = matmul(
+        "router",
+        &mlp_normed,
+        "router_proj",
+        u64::from(moe.experts),
+        None,
+    );
+    let routed = add_node(
+        &format!("{prefix}.experts"),
+        "moe-experts",
+        "LinearAlgebra",
+        &[
+            attr("experts", AttributeValue::Integer(i64::from(moe.experts))),
+            attr(
+                "top_k",
+                AttributeValue::Integer(i64::from(moe.experts_per_token)),
+            ),
+            attr(
+                "normalize_top_k",
+                AttributeValue::Boolean(moe.normalize_top_k),
+            ),
+            tensor_parallel("experts"),
+        ],
+        &[
+            mlp_normed.clone(),
+            logits,
+            weight_edge(&weight_tensor_name(layer, "experts_gate_proj")),
+            weight_edge(&weight_tensor_name(layer, "experts_up_proj")),
+            weight_edge(&weight_tensor_name(layer, "experts_down_proj")),
+        ],
+        &rows(hidden_size),
+        None,
+    );
+    let Some(shared_size) = moe.shared_expert_intermediate_size else {
+        return routed;
+    };
+    let gate = matmul(
+        "shared_gate_proj",
+        &mlp_normed,
+        "shared_gate_proj",
+        shared_size,
+        Some("column"),
+    );
+    let up = matmul(
+        "shared_up_proj",
+        &mlp_normed,
+        "shared_up_proj",
+        shared_size,
+        Some("column"),
+    );
+    let activated = add_node(
+        &format!("{prefix}.shared_silu"),
+        "silu",
+        "Activation",
+        &[tensor_parallel("local")],
+        &[gate],
+        &rows(shared_size),
+        None,
+    );
+    let hidden = add_node(
+        &format!("{prefix}.shared_mul"),
+        "mul",
+        "Tensor",
+        &[tensor_parallel("local")],
+        &[activated, up],
+        &rows(shared_size),
+        None,
+    );
+    let shared = matmul(
+        "shared_down_proj",
+        &hidden,
+        "shared_down_proj",
+        hidden_size,
+        Some("row"),
+    );
+    let gate_logit = matmul(
+        "shared_expert_gate",
+        &mlp_normed,
+        "shared_expert_gate",
+        1,
+        None,
+    );
+    let scale = add_node(
+        &format!("{prefix}.shared_expert_scale"),
+        "activation",
+        "Activation",
+        &[attr("kind", AttributeValue::Text("sigmoid".to_string()))],
+        &[gate_logit],
+        &rows(1),
+        None,
+    );
+    let scaled = add_node(
+        &format!("{prefix}.shared_expert_scaled"),
+        "row-scale",
+        "Tensor",
+        &[],
+        &[shared, scale],
+        &rows(hidden_size),
+        None,
+    );
     add_node(
-        &format!("{prefix}.residual2"),
+        &format!("{prefix}.moe_out"),
         "residual-add",
         "Tensor",
         &[],
-        &[post_attn, mlp_out],
-        &shape(vec![sequence_length, hidden_size]),
+        &[routed, scaled],
+        &rows(hidden_size),
         None,
     )
 }
@@ -398,6 +583,12 @@ fn build_graph_segment(
     end_layer: u32,
 ) -> String {
     let config = model_config::model_config();
+    // A scheme this Component does not apply must not be ignored.
+    assert!(
+        model_config::rope_scaling().is_none(),
+        "the Qwen Component does not apply a per-frequency RoPE scaling"
+    );
+    let moe = model_config::mixture_of_experts();
     begin_graph(phase, sequence_length, position_offset);
 
     let mut hidden = if start_layer == 0 {
@@ -420,7 +611,14 @@ fn build_graph_segment(
     };
 
     for layer in start_layer as u64..end_layer as u64 {
-        hidden = build_layer(&config, layer, &hidden, sequence_length, kv_append);
+        hidden = build_layer(
+            &config,
+            moe.as_ref(),
+            layer,
+            &hidden,
+            sequence_length,
+            kv_append,
+        );
     }
 
     if end_layer == config.num_hidden_layers {

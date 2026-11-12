@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.3.0;
+package magnetar:model-component-graph@1.5.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -167,6 +167,56 @@ interface model-config {
   /// posture, matching `graph-builder`'s own "a well-behaved Component
   /// never triggers one").
   model-config: func() -> architecture-config;
+
+  /// Wavelength-banded RoPE frequency scaling: pairs whose wavelength is
+  /// below `original-max-position-embeddings / high-freq-factor` keep their
+  /// frequency, those above `original-max-position-embeddings /
+  /// low-freq-factor` divide it by `factor`, and the band in between is
+  /// interpolated (Hugging Face `rope_type = "llama3"`). Added in `1.4.0`.
+  record banded-rope-scaling {
+    factor: f64,
+    low-freq-factor: f64,
+    high-freq-factor: f64,
+    original-max-position-embeddings: u64,
+  }
+
+  /// A per-frequency RoPE scaling scheme the checkpoint declares. Added in
+  /// `1.4.0`; new schemes are new cases.
+  variant rope-frequency-scaling {
+    banded(banded-rope-scaling),
+  }
+
+  /// Added in `1.4.0`: the per-frequency RoPE scaling the active Model
+  /// Instance's checkpoint declares, `none` when it declares none. It is
+  /// the Component's to interpret: a Component that understands the scheme
+  /// declares it on its `rope` nodes (`frequency_scaling` attributes); one
+  /// that does not must refuse to build a graph rather than ignore it.
+  /// A new function, not a new `architecture-config` field, so Components
+  /// compiled against earlier versions keep linking.
+  rope-scaling: func() -> option<rope-frequency-scaling>;
+
+  /// A decoder MLP made of routed experts (`execute-and-cache-moe-experts`
+  /// F02). Added in `1.5.0`.
+  record moe-config {
+    /// Routed experts per layer.
+    experts: u32,
+    /// Experts each token is routed to.
+    experts-per-token: u32,
+    /// Each routed expert's intermediate size.
+    expert-intermediate-size: u64,
+    /// The always-active shared expert's intermediate size, if any.
+    shared-expert-intermediate-size: option<u64>,
+    /// Whether the chosen experts' probabilities are renormalized to sum
+    /// to one.
+    normalize-top-k: bool,
+  }
+
+  /// Added in `1.5.0`: the mixture of experts every decoder layer's MLP is,
+  /// `none` for a dense checkpoint. A Component that does not understand a
+  /// declared mixture of experts must refuse to build a graph rather than
+  /// build a dense one. A new function, not a new `architecture-config`
+  /// field, so Components compiled against earlier versions keep linking.
+  mixture-of-experts: func() -> option<moe-config>;
 }
 
 /// World a Model Component satisfies to produce graphs through this
