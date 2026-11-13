@@ -61,3 +61,35 @@ This Component is loaded and validated by the Runtime's Component Engine
 runs with direct hardware, filesystem, or network access. It is pinned into
 the main [Magnetar](https://github.com/astorise/Magnetar) repository as a
 git submodule at `components/qwen`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on every push to
+`main`. It calls the Module CI workflow that the main
+[Magnetar](https://github.com/astorise/Magnetar) repository defines once for
+all module repositories
+([`submodule-ci.yml`](https://github.com/astorise/Magnetar/blob/main/.github/workflows/submodule-ci.yml)):
+formatting, tests with the committed `Cargo.lock`, and `cargo-deny`.
+
+The crate is built inside a Magnetar checkout, at `components/qwen`, with the Rust
+toolchain Magnetar pins. The Magnetar revision is the branch named like this
+repository's branch when Magnetar has one, otherwise Magnetar's `main`; the
+first step of each run prints which one was used. A change that spans both
+repositories is validated by pushing the Magnetar branch first, then a branch
+of the same name here.
+
+Clippy is not run here: the package name fails the `non_snake_case` lint on
+the crate name.
+
+A test failure that names `Cargo.lock` means the Runtime's dependency set
+changed in Magnetar; refresh the lockfile with `cargo update -w` from this
+crate's directory inside a Magnetar checkout.
+
+To reproduce the checks locally, from a Magnetar checkout with this
+repository at its submodule path:
+
+```bash
+cargo fmt --manifest-path components/qwen/Cargo.toml -- --check
+cargo test --locked --manifest-path components/qwen/Cargo.toml
+cargo deny --manifest-path components/qwen/Cargo.toml check
+```
