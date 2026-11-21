@@ -14,7 +14,7 @@ not Providers or Devices).
 
 **Real, configurable, production implementation.** `src/lib.rs` builds
 prefill and decode Execution Graphs through
-`magnetar:model-component-graph@1.1.0`'s `graph-builder` and `model-config`
+`magnetar:model-component-graph@1.8.0`'s `graph-builder` and `model-config`
 Capabilities (vendored under `wit/`), using `wit-bindgen`-generated
 bindings -- this crate never depends on `magnetar-runtime`'s Rust types,
 only the WIT contract. Compiles to a real Component via
@@ -30,6 +30,9 @@ configuration -- distinct attention/KV head counts -- produces a correct
 graph through this same compiled binary, not only the canonical tiny E2E
 fixture dimensions), plus real CUDA hardware evidence in the main
 repository's `integration-tests/cuda-first-native`.
+
+Each graph build requires the checkpoint's activation to be known and equal
+to `silu`; unknown and incompatible activations are rejected.
 
 `1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
 Component checkpoint-configurable: architecture dimensions (hidden size,

@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.5.0;
+package magnetar:model-component-graph@1.8.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -180,10 +180,33 @@ interface model-config {
     original-max-position-embeddings: u64,
   }
 
+  /// YaRN RoPE frequency scaling (Hugging Face `rope_type = "yarn"`). Added
+  /// in `1.7.0`. Each rotated pair blends its frequency `f` with
+  /// `f / factor` along a ramp whose bounds are the pairs completing
+  /// `beta-fast` and `beta-slow` rotations over
+  /// `original-max-position-embeddings` positions (widened to whole pairs
+  /// when `truncate`); `cos` and `sin` are multiplied by `attention-factor`.
+  /// A Component states all of it on its `rope` nodes
+  /// (`frequency_scaling = "yarn"`). `mscale-all-dim` is the checkpoint's
+  /// own value, for a Component whose model also rescales its attention
+  /// softmax by it.
+  record yarn-rope-scaling {
+    factor: f64,
+    original-max-position-embeddings: u64,
+    beta-fast: f64,
+    beta-slow: f64,
+    truncate: bool,
+    attention-factor: f64,
+    mscale-all-dim: option<f64>,
+  }
+
   /// A per-frequency RoPE scaling scheme the checkpoint declares. Added in
-  /// `1.4.0`; new schemes are new cases.
+  /// `1.4.0`; new schemes are new cases (`yarn` in `1.7.0`). A Component
+  /// compiled against an earlier version cannot receive a newer case: the
+  /// call traps instead of returning a scheme it would ignore.
   variant rope-frequency-scaling {
     banded(banded-rope-scaling),
+    yarn(yarn-rope-scaling),
   }
 
   /// Added in `1.4.0`: the per-frequency RoPE scaling the active Model
@@ -217,6 +240,131 @@ interface model-config {
   /// build a dense one. A new function, not a new `architecture-config`
   /// field, so Components compiled against earlier versions keep linking.
   mixture-of-experts: func() -> option<moe-config>;
+
+  /// One decoder layer's attention and feed-forward geometry. Added in
+  /// `1.6.0`. Family-neutral: it describes what differs *between layers* of a
+  /// checkpoint (sliding vs. full attention, head widths, KV head counts,
+  /// RoPE per attention kind, shared KV, feed-forward width), not any model
+  /// family. The Runtime derives every field from the checkpoint's
+  /// configuration; a Component never recomputes a per-layer rule.
+  record layer-spec {
+    /// Look-back window in tokens; `none` attends over the whole context.
+    sliding-window: option<u32>,
+    /// Width of one attention head in this layer.
+    head-dimension: u64,
+    /// Key/value heads in this layer.
+    num-key-value-heads: u32,
+    /// RoPE base of this layer.
+    rope-theta: f64,
+    /// Fraction of each head that is rotated, the rest staying
+    /// position-independent; `none` rotates the whole head.
+    partial-rotary-factor: option<f64>,
+    /// The layer has no value projection: V is derived from the raw key
+    /// projection.
+    value-from-key: bool,
+    /// The layer computes no K/V of its own and attends over those of this
+    /// earlier layer, which must have the same head width and KV head count.
+    kv-source-layer: option<u32>,
+    /// Width of the layer's dense feed-forward.
+    intermediate-size: u64,
+  }
+
+  /// Added in `1.6.0`: one `layer-spec` per decoder layer
+  /// (`num-hidden-layers` entries), `none` for a checkpoint whose layers are
+  /// uniform and fully described by `architecture-config`. A Component that
+  /// needs a layout and gets `none` must refuse to build a graph.
+  layer-layout: func() -> option<list<layer-spec>>;
+
+  /// Checkpoint-wide options `architecture-config` cannot carry. Added in
+  /// `1.6.0`.
+  record architecture-options {
+    /// `cap * tanh(logits / cap)` applied to the logits.
+    final-logit-softcapping: option<f64>,
+    /// Width of the per-layer input embeddings, `none` for none. A Component
+    /// that does not implement them must refuse to build a graph.
+    per-layer-input-size: option<u32>,
+  }
+
+  options: func() -> architecture-options;
+
+  /// Multi-head latent attention. Added in `1.7.0`. Queries come from a
+  /// `q-lora-rank`-wide low-rank projection when it is set, else from the
+  /// hidden state directly; keys and values from a `kv-lora-rank`-wide
+  /// latent. Each query/key head is `qk-nope-head-dim` position-independent
+  /// values followed by `qk-rope-head-dim` rotated ones, the rotated key part
+  /// being one head shared by every head; each value head is `v-head-dim`
+  /// wide. `architecture-config.head-dimension` is then
+  /// `qk-nope-head-dim + qk-rope-head-dim`, and its `num-key-value-heads` the
+  /// number of attention heads.
+  record mla-config {
+    q-lora-rank: option<u32>,
+    kv-lora-rank: u32,
+    qk-nope-head-dim: u64,
+    qk-rope-head-dim: u64,
+    v-head-dim: u64,
+  }
+
+  /// Added in `1.7.0`: the latent attention every layer uses, `none` for
+  /// ordinary attention. A Component that does not implement it must refuse
+  /// to build a graph; the Runtime also refuses a graph built without
+  /// reading this function when it is not `none`.
+  multi-head-latent-attention: func() -> option<mla-config>;
+
+  /// Added in `1.7.0`: one entry per decoder layer, `true` where the layer's
+  /// MLP is the declared `mixture-of-experts` and `false` where it is a dense
+  /// MLP of `intermediate-size`; `none` when every layer's MLP is the
+  /// mixture of experts (the `1.5.0` meaning). The Runtime refuses a graph
+  /// built without reading this function when it is not `none`.
+  mixture-of-experts-layers: func() -> option<list<bool>>;
+
+  /// How router logits become expert scores. Added in `1.7.0`.
+  enum expert-scoring {
+    softmax,
+    sigmoid,
+  }
+
+  /// How a group of experts is scored for group-limited routing. Added in
+  /// `1.7.0`.
+  enum expert-group-score {
+    /// Its best expert's score.
+    max,
+    /// The sum of its two best experts' scores.
+    top-two-sum,
+  }
+
+  /// Group-limited routing: the experts form `count` equal groups, and a
+  /// token's experts come from its `per-token` best groups only. Added in
+  /// `1.7.0`.
+  record expert-groups {
+    count: u32,
+    per-token: u32,
+    score: expert-group-score,
+  }
+
+  /// How tokens are routed to the experts. Added in `1.7.0`.
+  record expert-routing-config {
+    scoring: expert-scoring,
+    groups: option<expert-groups>,
+    /// The factor on the chosen experts' combination weights.
+    routed-scaling-factor: f64,
+    /// A per-expert bias is added to the scores to choose the experts, not
+    /// to weight them.
+    selection-bias: bool,
+    /// Whether the shared expert's output passes through a sigmoid gate.
+    shared-expert-gated: bool,
+  }
+
+  /// Added in `1.7.0`: the routing of the declared `mixture-of-experts`.
+  /// `none` keeps the `1.5.0` routing: a softmax over every expert, no
+  /// groups, unscaled weights, no selection bias, and a gated shared expert
+  /// when the mixture declares one. The Runtime refuses a graph built
+  /// without reading this function when it is not `none`.
+  expert-routing: func() -> option<expert-routing-config>;
+
+  /// Added in 1.8.0. The checkpoint's normalized MLP activation; `none`
+  /// means the source did not establish it. A Component must reject an
+  /// unknown value or an activation its graph does not implement.
+  hidden-activation: func() -> option<string>;
 }
 
 /// World a Model Component satisfies to produce graphs through this

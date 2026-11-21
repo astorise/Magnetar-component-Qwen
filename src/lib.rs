@@ -582,6 +582,11 @@ fn build_graph_segment(
     start_layer: u32,
     end_layer: u32,
 ) -> String {
+    match model_config::hidden_activation().as_deref() {
+        Some("silu") => {}
+        Some(other) => panic!("the Qwen Component does not support activation {other:?}"),
+        None => panic!("the Qwen Component requires a known checkpoint activation"),
+    }
     let config = model_config::model_config();
     // A scheme this Component does not apply must not be ignored.
     assert!(
