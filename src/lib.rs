@@ -17,6 +17,9 @@
 //! configuration for (Decision 7 -- "Qwen weight names and shapes become
 //! configuration-derived").
 
+/// Standalone CPU reference for Qwen3.5's gated-delta recurrence.
+pub mod qwen35_delta_reference;
+
 wit_bindgen::generate!({
     path: "wit/model-component-graph.wit",
     world: "model-component-graph-producer",
