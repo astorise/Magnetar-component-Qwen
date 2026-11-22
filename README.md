@@ -38,9 +38,11 @@ The separate Qwen3.5 f32 CPU references implement its gated-delta recurrent
 core and linear-attention mixer, including projections, convolution, gated
 normalization and explicit convolution/recurrent states. Independent PyTorch
 fixtures cover full and chunked execution, cached steps and reset with
-synthetic weights. These references are not part of the Component graph or
-Runtime generation: Qwen3.5's hybrid graph and managed recurrent state remain
-unsupported.
+synthetic weights. An opt-in comparison also reads the first mixer weights
+from a verified Qwen3.5-0.8B-Base checkpoint, converts them to f32 and compares
+them with the pinned upstream PyTorch class. These references are not part of
+the Component graph or Runtime generation: Qwen3.5's hybrid graph and managed
+recurrent state remain unsupported.
 
 `1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
 Component checkpoint-configurable: architecture dimensions (hidden size,

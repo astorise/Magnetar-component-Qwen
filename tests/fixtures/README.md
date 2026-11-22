@@ -27,3 +27,27 @@ The test compares both state tensors and outputs for masked inputs, full and
 chunked calls, single-token continuation and reset. Regenerate it with
 python tests/fixtures/generate_mixer_reference.py MODELING_QWEN3_5.py CACHE_UTILS.py.
 This does not qualify checkpoint weights, BF16, a full model or Runtime state.
+
+## Optional comparison with real checkpoint weights
+
+The selected [Qwen3.5-0.8B-Base revision](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/tree/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68)
+is Apache-2.0. The complete 1,746,942,600-byte Safetensors file has SHA-256
+`c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c`.
+The extraction script verifies this complete digest before retaining only its
+header and two byte ranges containing the nine first-mixer tensors. No model
+payloads or real-weight reference outputs are committed.
+
+To reproduce, use PyTorch and either a downloaded checkpoint or the explicit
+download option (which reads the full 1.75 GB file but retains about 21 MB):
+
+    python tests/fixtures/extract_checkpoint_mixer.py CHECKPOINT.safetensors OUTPUT_DIR
+    python tests/fixtures/extract_checkpoint_mixer.py --download OUTPUT_DIR
+    python tests/fixtures/generate_checkpoint_mixer_reference.py MODELING_QWEN3_5.py CACHE_UTILS.py OUTPUT_DIR/kev-qwen35-base-header.json OUTPUT_DIR
+
+Then set MAGNETAR_QWEN35_CHECKPOINT_DIR to OUTPUT_DIR and run
+`cargo test --locked --test qwen35_checkpoint -- --ignored --nocapture`.
+Both the generator and Rust test check the header and extracted ranges. They
+compare the upstream class with the Rust mixer for a synthetic three-token
+hidden input, full prefill, a two-token prefix and a cached decode step,
+including both states. BF16 checkpoint storage is converted to f32 first;
+this does not qualify native BF16, LoRA activation, or a complete model.
