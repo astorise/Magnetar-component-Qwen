@@ -19,6 +19,8 @@
 
 /// Standalone CPU reference for Qwen3.5's gated-delta recurrence.
 pub mod qwen35_delta_reference;
+/// Standalone CPU reference for one Qwen3.5 linear-attention mixer.
+pub mod qwen35_mixer_reference;
 
 wit_bindgen::generate!({
     path: "wit/model-component-graph.wit",

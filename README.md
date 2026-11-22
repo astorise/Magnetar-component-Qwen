@@ -34,12 +34,13 @@ repository's `integration-tests/cuda-first-native`.
 Each graph build requires the checkpoint's activation to be known and equal
 to `silu`; unknown and incompatible activations are rejected.
 
-The separate Qwen3.5 gated-delta f32 CPU reference implements its recurrent
-core for explicit state, including grouped key/value heads. Independent
-PyTorch fixtures cover full and chunked execution, cached steps and reset.
-This reference is not part of the Component graph or Runtime generation:
-Qwen3.5 projections, convolution, hybrid graph and managed recurrent state
-remain unsupported.
+The separate Qwen3.5 f32 CPU references implement its gated-delta recurrent
+core and linear-attention mixer, including projections, convolution, gated
+normalization and explicit convolution/recurrent states. Independent PyTorch
+fixtures cover full and chunked execution, cached steps and reset with
+synthetic weights. These references are not part of the Component graph or
+Runtime generation: Qwen3.5's hybrid graph and managed recurrent state remain
+unsupported.
 
 `1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
 Component checkpoint-configurable: architecture dimensions (hidden size,
