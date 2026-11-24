@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.8.0;
+package magnetar:model-component-graph@1.13.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -29,6 +29,8 @@ interface graph-builder {
   enum graph-phase {
     prefill,
     decode,
+    /// A bidirectional encoder pass, separate from decoder generation.
+    encode,
   }
 
   enum kv-cache-role {
@@ -95,6 +97,26 @@ interface graph-builder {
   /// `role`, for use in a subsequent `add-node` call's `kv` argument.
   kv-resource: func(layer: u64, role: kv-cache-role) -> string;
 
+  /// Issues an opaque logical identity for a fixed-size recurrent slot at a
+  /// particular layer. Slot names are 1-64 ASCII letters, digits, `_` or `-`;
+  /// shapes have nonzero fixed dimensions and at most 67,108,864 f32 elements.
+  /// The same layer/slot must have the same shape throughout one graph.
+  /// These identities describe state, not Provider handles or KV caches.
+  /// Added in 1.11.0. Since 1.13.0 the first-native Runtime executes such
+  /// graphs: it keeps the state per KV cache, zero for a new sequence, and
+  /// commits it with the accepted token (`support-qwen38-flash-next`).
+  recurrent-resource: func(layer: u64, slot: string, shape: tensor-shape) -> string;
+
+  /// Declares the prior committed value of a resource as an input edge.
+  /// A new sequence starts from zeros. Each resource must have exactly one
+  /// consumed input and one same-shaped output in the graph.
+  recurrent-input: func(resource-id: string) -> string;
+
+  /// Associates a node's output edge with the next value of a resource.
+  /// State is committed only with the accepted token/segment, atomically with
+  /// related KV updates; a failure must preserve the previous generation.
+  recurrent-output: func(resource-id: string, edge-id: string);
+
   /// Adds one graph node: `operator`/`family` name a portable Operator
   /// identity (never a Provider-specific Kernel name -- Requirement
   /// "Graph Builder Node and Operator Identity"), `inputs` are edge ids
@@ -114,6 +136,20 @@ interface graph-builder {
     output-shape: tensor-shape,
     kv: option<kv-involvement>,
   ) -> string;
+
+  /// Adds one Operator with 1-16 independently addressable output edges.
+  /// Output shapes are in Operator order; each returned edge may be consumed
+  /// by later nodes or bound as a recurrent output. Unlike `add-node`, this
+  /// additive 1.11.0 form does not attach KV metadata. Arity and shapes are
+  /// validated against the portable Operator catalog at `finish-graph`.
+  add-node-outputs: func(
+    node-id: string,
+    operator: string,
+    family: string,
+    attributes: list<attribute>,
+    inputs: list<string>,
+    output-shapes: list<tensor-shape>,
+  ) -> list<string>;
 
   /// Declares `edge-id` as the graph's output (e.g. "logits"), finalizes
   /// and validates the graph, and returns an opaque graph handle the
@@ -365,6 +401,93 @@ interface model-config {
   /// means the source did not establish it. A Component must reject an
   /// unknown value or an activation its graph does not implement.
   hidden-activation: func() -> option<string>;
+
+  /// Explicit per-layer Q/K rotary selection, added in 1.9.0. Each entry
+  /// is true for RoPE and false for position-independent Q/K; the list has
+  /// exactly num-hidden-layers entries. None uses the Component's baseline.
+  rope-layers: func() -> option<list<bool>>;
+
+  /// Explicit normalization of selected expert scores, added in 1.10.0.
+  /// `multiple-experts` leaves top-1 unnormalized; `always` normalizes it.
+  enum expert-normalization-mode {
+    never,
+    multiple-experts,
+    always,
+  }
+
+  /// `none` keeps the older Component contract's behavior. A Component
+  /// must read a declared value and reject one its graph cannot implement.
+  expert-normalization: func() -> option<expert-normalization-mode>;
+
+  /// Epsilon of the query and KV latent bottleneck normalizations, when
+  /// different from the decoder-wide epsilon. Added in 1.10.0; `none` keeps
+  /// the earlier Component behavior. A declared value must be read.
+  latent-norm-epsilon: func() -> option<f64>;
+
+  /// One bidirectional encoder layer, in checkpoint order. The local radius
+  /// is symmetric and inclusive; none means global attention.
+  record encoder-layer-config {
+    local-radius: option<u32>,
+    rope-theta: f64,
+    attention-normalization: bool,
+  }
+
+  /// Geometry not represented by the decoder architecture record. Token
+  /// positions are physical zero-based indices in this initial profile.
+  record encoder-settings {
+    norm-epsilon: f64,
+    max-positions: u64,
+    norm-bias: bool,
+    attention-bias: bool,
+    mlp-bias: bool,
+    layers: list<encoder-layer-config>,
+  }
+
+  /// Added in 1.12.0. A declared encoder configuration must be read by its
+  /// Component before a graph is accepted; older Components cannot ignore it.
+  encoder-config: func() -> option<encoder-settings>;
+
+  /// The gated-delta linear attention layers of a hybrid decoder (Qwen3.5).
+  /// Added in 1.13.0. A linear layer mixes tokens with a `gated-delta-mixer`
+  /// whose convolution and recurrent states are recurrent resources; it has
+  /// no KV history. The other layers are full attention.
+  record linear-attention-config {
+    /// One entry per decoder layer: true for a linear layer.
+    layers: list<bool>,
+    key-heads: u32,
+    value-heads: u32,
+    key-head-dimension: u64,
+    value-head-dimension: u64,
+    conv-kernel: u32,
+  }
+
+  /// Added in 1.13.0: `none` when every layer is full attention. A declared
+  /// value must be read before a graph is accepted.
+  linear-attention: func() -> option<linear-attention-config>;
+
+  /// Decoder forms `architecture-config` cannot carry. Added in 1.13.0.
+  record decoder-variant-config {
+    /// Every decoder RMSNorm scales by `norm-weight-offset + weight`
+    /// (Qwen3.5's zero-centered norms: 1). The linear-attention mixer's
+    /// gated norm keeps its plain weight.
+    norm-weight-offset: f64,
+    /// Each attention head's query projection is followed by a gate of the
+    /// same width; the attention output is multiplied by its sigmoid.
+    attention-output-gate: bool,
+  }
+
+  /// Added in 1.13.0: `none` keeps the plain forms. A declared value must
+  /// be read before a graph is accepted.
+  decoder-variants: func() -> option<decoder-variant-config>;
+}
+
+/// A separate graph-producing world for one bidirectional encoder pass.
+/// Inputs are token IDs and a binary key mask; the output is per-token
+/// hidden states. It does not expose generation or decoder KV semantics.
+world encoder-component-graph-producer {
+  import graph-builder;
+  import model-config;
+  export build-encoder-graph: func(sequence-length: u64) -> string;
 }
 
 /// World a Model Component satisfies to produce graphs through this

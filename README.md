@@ -14,7 +14,7 @@ not Providers or Devices).
 
 **Real, configurable, production implementation.** `src/lib.rs` builds
 prefill and decode Execution Graphs through
-`magnetar:model-component-graph@1.8.0`'s `graph-builder` and `model-config`
+`magnetar:model-component-graph@1.13.0`'s `graph-builder` and `model-config`
 Capabilities (vendored under `wit/`), using `wit-bindgen`-generated
 bindings -- this crate never depends on `magnetar-runtime`'s Rust types,
 only the WIT contract. Compiles to a real Component via
@@ -40,9 +40,24 @@ normalization and explicit convolution/recurrent states. Independent PyTorch
 fixtures cover full and chunked execution, cached steps and reset with
 synthetic weights. An opt-in comparison also reads the first mixer weights
 from a verified Qwen3.5-0.8B-Base checkpoint, converts them to f32 and compares
-them with the pinned upstream PyTorch class. These references are not part of
-the Component graph or Runtime generation: Qwen3.5's hybrid graph and managed
-recurrent state remain unsupported.
+them with the pinned upstream PyTorch class.
+
+Qwen3.5's hybrid decoder (`qwen3_5`, `qwen3_5_text`; `support-qwen38-flash-next`)
+is built from `model-config` 1.13.0's `linear-attention` and
+`decoder-variants`:
+
+- **Linear layers:** a `gated-delta-mixer` node whose convolution (`conv`)
+  and recurrent (`delta`) states are recurrent resources, which the Runtime
+  keeps between steps.
+- **Full-attention layers:** each head's query and gate are split from
+  `q_proj`, the query and key are normalized per head, a partial rotary
+  is applied, and the output is multiplied by the gate's sigmoid.
+- **Norms:** every decoder RMSNorm scales by `1 + weight`.
+
+A tiny random Qwen3.5 checkpoint matches `transformers` in the main
+repository's `integration-tests/production-loading`
+(`tests_qwen3_5_logits`). The real Qwen3.5-0.8B-Base checkpoint is not
+qualified yet.
 
 `1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
 Component checkpoint-configurable: architecture dimensions (hidden size,
