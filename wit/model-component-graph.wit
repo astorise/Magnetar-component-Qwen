@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.5.0;
+package magnetar:model-component-graph@1.13.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -29,6 +29,8 @@ interface graph-builder {
   enum graph-phase {
     prefill,
     decode,
+    /// A bidirectional encoder pass, separate from decoder generation.
+    encode,
   }
 
   enum kv-cache-role {
@@ -95,6 +97,26 @@ interface graph-builder {
   /// `role`, for use in a subsequent `add-node` call's `kv` argument.
   kv-resource: func(layer: u64, role: kv-cache-role) -> string;
 
+  /// Issues an opaque logical identity for a fixed-size recurrent slot at a
+  /// particular layer. Slot names are 1-64 ASCII letters, digits, `_` or `-`;
+  /// shapes have nonzero fixed dimensions and at most 67,108,864 f32 elements.
+  /// The same layer/slot must have the same shape throughout one graph.
+  /// These identities describe state, not Provider handles or KV caches.
+  /// Added in 1.11.0. Since 1.13.0 the first-native Runtime executes such
+  /// graphs: it keeps the state per KV cache, zero for a new sequence, and
+  /// commits it with the accepted token (`support-qwen38-flash-next`).
+  recurrent-resource: func(layer: u64, slot: string, shape: tensor-shape) -> string;
+
+  /// Declares the prior committed value of a resource as an input edge.
+  /// A new sequence starts from zeros. Each resource must have exactly one
+  /// consumed input and one same-shaped output in the graph.
+  recurrent-input: func(resource-id: string) -> string;
+
+  /// Associates a node's output edge with the next value of a resource.
+  /// State is committed only with the accepted token/segment, atomically with
+  /// related KV updates; a failure must preserve the previous generation.
+  recurrent-output: func(resource-id: string, edge-id: string);
+
   /// Adds one graph node: `operator`/`family` name a portable Operator
   /// identity (never a Provider-specific Kernel name -- Requirement
   /// "Graph Builder Node and Operator Identity"), `inputs` are edge ids
@@ -114,6 +136,20 @@ interface graph-builder {
     output-shape: tensor-shape,
     kv: option<kv-involvement>,
   ) -> string;
+
+  /// Adds one Operator with 1-16 independently addressable output edges.
+  /// Output shapes are in Operator order; each returned edge may be consumed
+  /// by later nodes or bound as a recurrent output. Unlike `add-node`, this
+  /// additive 1.11.0 form does not attach KV metadata. Arity and shapes are
+  /// validated against the portable Operator catalog at `finish-graph`.
+  add-node-outputs: func(
+    node-id: string,
+    operator: string,
+    family: string,
+    attributes: list<attribute>,
+    inputs: list<string>,
+    output-shapes: list<tensor-shape>,
+  ) -> list<string>;
 
   /// Declares `edge-id` as the graph's output (e.g. "logits"), finalizes
   /// and validates the graph, and returns an opaque graph handle the
@@ -180,10 +216,33 @@ interface model-config {
     original-max-position-embeddings: u64,
   }
 
+  /// YaRN RoPE frequency scaling (Hugging Face `rope_type = "yarn"`). Added
+  /// in `1.7.0`. Each rotated pair blends its frequency `f` with
+  /// `f / factor` along a ramp whose bounds are the pairs completing
+  /// `beta-fast` and `beta-slow` rotations over
+  /// `original-max-position-embeddings` positions (widened to whole pairs
+  /// when `truncate`); `cos` and `sin` are multiplied by `attention-factor`.
+  /// A Component states all of it on its `rope` nodes
+  /// (`frequency_scaling = "yarn"`). `mscale-all-dim` is the checkpoint's
+  /// own value, for a Component whose model also rescales its attention
+  /// softmax by it.
+  record yarn-rope-scaling {
+    factor: f64,
+    original-max-position-embeddings: u64,
+    beta-fast: f64,
+    beta-slow: f64,
+    truncate: bool,
+    attention-factor: f64,
+    mscale-all-dim: option<f64>,
+  }
+
   /// A per-frequency RoPE scaling scheme the checkpoint declares. Added in
-  /// `1.4.0`; new schemes are new cases.
+  /// `1.4.0`; new schemes are new cases (`yarn` in `1.7.0`). A Component
+  /// compiled against an earlier version cannot receive a newer case: the
+  /// call traps instead of returning a scheme it would ignore.
   variant rope-frequency-scaling {
     banded(banded-rope-scaling),
+    yarn(yarn-rope-scaling),
   }
 
   /// Added in `1.4.0`: the per-frequency RoPE scaling the active Model
@@ -217,6 +276,218 @@ interface model-config {
   /// build a dense one. A new function, not a new `architecture-config`
   /// field, so Components compiled against earlier versions keep linking.
   mixture-of-experts: func() -> option<moe-config>;
+
+  /// One decoder layer's attention and feed-forward geometry. Added in
+  /// `1.6.0`. Family-neutral: it describes what differs *between layers* of a
+  /// checkpoint (sliding vs. full attention, head widths, KV head counts,
+  /// RoPE per attention kind, shared KV, feed-forward width), not any model
+  /// family. The Runtime derives every field from the checkpoint's
+  /// configuration; a Component never recomputes a per-layer rule.
+  record layer-spec {
+    /// Look-back window in tokens; `none` attends over the whole context.
+    sliding-window: option<u32>,
+    /// Width of one attention head in this layer.
+    head-dimension: u64,
+    /// Key/value heads in this layer.
+    num-key-value-heads: u32,
+    /// RoPE base of this layer.
+    rope-theta: f64,
+    /// Fraction of each head that is rotated, the rest staying
+    /// position-independent; `none` rotates the whole head.
+    partial-rotary-factor: option<f64>,
+    /// The layer has no value projection: V is derived from the raw key
+    /// projection.
+    value-from-key: bool,
+    /// The layer computes no K/V of its own and attends over those of this
+    /// earlier layer, which must have the same head width and KV head count.
+    kv-source-layer: option<u32>,
+    /// Width of the layer's dense feed-forward.
+    intermediate-size: u64,
+  }
+
+  /// Added in `1.6.0`: one `layer-spec` per decoder layer
+  /// (`num-hidden-layers` entries), `none` for a checkpoint whose layers are
+  /// uniform and fully described by `architecture-config`. A Component that
+  /// needs a layout and gets `none` must refuse to build a graph.
+  layer-layout: func() -> option<list<layer-spec>>;
+
+  /// Checkpoint-wide options `architecture-config` cannot carry. Added in
+  /// `1.6.0`.
+  record architecture-options {
+    /// `cap * tanh(logits / cap)` applied to the logits.
+    final-logit-softcapping: option<f64>,
+    /// Width of the per-layer input embeddings, `none` for none. A Component
+    /// that does not implement them must refuse to build a graph.
+    per-layer-input-size: option<u32>,
+  }
+
+  options: func() -> architecture-options;
+
+  /// Multi-head latent attention. Added in `1.7.0`. Queries come from a
+  /// `q-lora-rank`-wide low-rank projection when it is set, else from the
+  /// hidden state directly; keys and values from a `kv-lora-rank`-wide
+  /// latent. Each query/key head is `qk-nope-head-dim` position-independent
+  /// values followed by `qk-rope-head-dim` rotated ones, the rotated key part
+  /// being one head shared by every head; each value head is `v-head-dim`
+  /// wide. `architecture-config.head-dimension` is then
+  /// `qk-nope-head-dim + qk-rope-head-dim`, and its `num-key-value-heads` the
+  /// number of attention heads.
+  record mla-config {
+    q-lora-rank: option<u32>,
+    kv-lora-rank: u32,
+    qk-nope-head-dim: u64,
+    qk-rope-head-dim: u64,
+    v-head-dim: u64,
+  }
+
+  /// Added in `1.7.0`: the latent attention every layer uses, `none` for
+  /// ordinary attention. A Component that does not implement it must refuse
+  /// to build a graph; the Runtime also refuses a graph built without
+  /// reading this function when it is not `none`.
+  multi-head-latent-attention: func() -> option<mla-config>;
+
+  /// Added in `1.7.0`: one entry per decoder layer, `true` where the layer's
+  /// MLP is the declared `mixture-of-experts` and `false` where it is a dense
+  /// MLP of `intermediate-size`; `none` when every layer's MLP is the
+  /// mixture of experts (the `1.5.0` meaning). The Runtime refuses a graph
+  /// built without reading this function when it is not `none`.
+  mixture-of-experts-layers: func() -> option<list<bool>>;
+
+  /// How router logits become expert scores. Added in `1.7.0`.
+  enum expert-scoring {
+    softmax,
+    sigmoid,
+  }
+
+  /// How a group of experts is scored for group-limited routing. Added in
+  /// `1.7.0`.
+  enum expert-group-score {
+    /// Its best expert's score.
+    max,
+    /// The sum of its two best experts' scores.
+    top-two-sum,
+  }
+
+  /// Group-limited routing: the experts form `count` equal groups, and a
+  /// token's experts come from its `per-token` best groups only. Added in
+  /// `1.7.0`.
+  record expert-groups {
+    count: u32,
+    per-token: u32,
+    score: expert-group-score,
+  }
+
+  /// How tokens are routed to the experts. Added in `1.7.0`.
+  record expert-routing-config {
+    scoring: expert-scoring,
+    groups: option<expert-groups>,
+    /// The factor on the chosen experts' combination weights.
+    routed-scaling-factor: f64,
+    /// A per-expert bias is added to the scores to choose the experts, not
+    /// to weight them.
+    selection-bias: bool,
+    /// Whether the shared expert's output passes through a sigmoid gate.
+    shared-expert-gated: bool,
+  }
+
+  /// Added in `1.7.0`: the routing of the declared `mixture-of-experts`.
+  /// `none` keeps the `1.5.0` routing: a softmax over every expert, no
+  /// groups, unscaled weights, no selection bias, and a gated shared expert
+  /// when the mixture declares one. The Runtime refuses a graph built
+  /// without reading this function when it is not `none`.
+  expert-routing: func() -> option<expert-routing-config>;
+
+  /// Added in 1.8.0. The checkpoint's normalized MLP activation; `none`
+  /// means the source did not establish it. A Component must reject an
+  /// unknown value or an activation its graph does not implement.
+  hidden-activation: func() -> option<string>;
+
+  /// Explicit per-layer Q/K rotary selection, added in 1.9.0. Each entry
+  /// is true for RoPE and false for position-independent Q/K; the list has
+  /// exactly num-hidden-layers entries. None uses the Component's baseline.
+  rope-layers: func() -> option<list<bool>>;
+
+  /// Explicit normalization of selected expert scores, added in 1.10.0.
+  /// `multiple-experts` leaves top-1 unnormalized; `always` normalizes it.
+  enum expert-normalization-mode {
+    never,
+    multiple-experts,
+    always,
+  }
+
+  /// `none` keeps the older Component contract's behavior. A Component
+  /// must read a declared value and reject one its graph cannot implement.
+  expert-normalization: func() -> option<expert-normalization-mode>;
+
+  /// Epsilon of the query and KV latent bottleneck normalizations, when
+  /// different from the decoder-wide epsilon. Added in 1.10.0; `none` keeps
+  /// the earlier Component behavior. A declared value must be read.
+  latent-norm-epsilon: func() -> option<f64>;
+
+  /// One bidirectional encoder layer, in checkpoint order. The local radius
+  /// is symmetric and inclusive; none means global attention.
+  record encoder-layer-config {
+    local-radius: option<u32>,
+    rope-theta: f64,
+    attention-normalization: bool,
+  }
+
+  /// Geometry not represented by the decoder architecture record. Token
+  /// positions are physical zero-based indices in this initial profile.
+  record encoder-settings {
+    norm-epsilon: f64,
+    max-positions: u64,
+    norm-bias: bool,
+    attention-bias: bool,
+    mlp-bias: bool,
+    layers: list<encoder-layer-config>,
+  }
+
+  /// Added in 1.12.0. A declared encoder configuration must be read by its
+  /// Component before a graph is accepted; older Components cannot ignore it.
+  encoder-config: func() -> option<encoder-settings>;
+
+  /// The gated-delta linear attention layers of a hybrid decoder (Qwen3.5).
+  /// Added in 1.13.0. A linear layer mixes tokens with a `gated-delta-mixer`
+  /// whose convolution and recurrent states are recurrent resources; it has
+  /// no KV history. The other layers are full attention.
+  record linear-attention-config {
+    /// One entry per decoder layer: true for a linear layer.
+    layers: list<bool>,
+    key-heads: u32,
+    value-heads: u32,
+    key-head-dimension: u64,
+    value-head-dimension: u64,
+    conv-kernel: u32,
+  }
+
+  /// Added in 1.13.0: `none` when every layer is full attention. A declared
+  /// value must be read before a graph is accepted.
+  linear-attention: func() -> option<linear-attention-config>;
+
+  /// Decoder forms `architecture-config` cannot carry. Added in 1.13.0.
+  record decoder-variant-config {
+    /// Every decoder RMSNorm scales by `norm-weight-offset + weight`
+    /// (Qwen3.5's zero-centered norms: 1). The linear-attention mixer's
+    /// gated norm keeps its plain weight.
+    norm-weight-offset: f64,
+    /// Each attention head's query projection is followed by a gate of the
+    /// same width; the attention output is multiplied by its sigmoid.
+    attention-output-gate: bool,
+  }
+
+  /// Added in 1.13.0: `none` keeps the plain forms. A declared value must
+  /// be read before a graph is accepted.
+  decoder-variants: func() -> option<decoder-variant-config>;
+}
+
+/// A separate graph-producing world for one bidirectional encoder pass.
+/// Inputs are token IDs and a binary key mask; the output is per-token
+/// hidden states. It does not expose generation or decoder KV semantics.
+world encoder-component-graph-producer {
+  import graph-builder;
+  import model-config;
+  export build-encoder-graph: func(sequence-length: u64) -> string;
 }
 
 /// World a Model Component satisfies to produce graphs through this
