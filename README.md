@@ -14,7 +14,7 @@ not Providers or Devices).
 
 **Real, configurable, production implementation.** `src/lib.rs` builds
 prefill and decode Execution Graphs through
-`magnetar:model-component-graph@1.13.0`'s `graph-builder` and `model-config`
+`magnetar:model-component-graph@1.14.0`'s `graph-builder` and `model-config`
 Capabilities (vendored under `wit/`), using `wit-bindgen`-generated
 bindings -- this crate never depends on `magnetar-runtime`'s Rust types,
 only the WIT contract. Compiles to a real Component via
@@ -54,10 +54,27 @@ is built from `model-config` 1.13.0's `linear-attention` and
   is applied, and the output is multiplied by the gate's sigmoid.
 - **Norms:** every decoder RMSNorm scales by `1 + weight`.
 
+Qwen4-Exp (`qwen4_exp`, `qwen4_exp_text`; `model-config` 1.14.0) adds,
+on top of those forms:
+
+- **Residual streams:** the embedding is repeated `hc_count` times, each
+  layer's token mixer and mixture of experts read a gated mix of the streams
+  (`gated-residual`) and are written back into every stream
+  (`gated-residual-inject`), and the final mix (`gated-residual-final`)
+  feeds the LM head. There are no decoder norms.
+- **Mixers:** the gated-delta mixer's output gate is `silu` or `sigmoid`
+  (`output_gate_type`); the full-attention layers are the gated Qwen3.5 ones.
+- **Experts:** every layer is a mixture of experts with a shared expert
+  behind a sigmoid gate.
+- **Not built yet:** the token indexer's selection (attention is dense, which
+  gives the indexer's result up to `budget + ratio - 1` visible tokens, and
+  a longer graph is refused) and the n-gram embeddings (refused).
+
 A tiny random Qwen3.5 checkpoint matches `transformers` in the main
 repository's `integration-tests/production-loading`
-(`tests_qwen3_5_logits`). The real Qwen3.5-0.8B-Base checkpoint is not
-qualified yet.
+(`tests_qwen3_5_logits`), as does a tiny random Qwen4-Exp one
+(`tests_qwen4_exp_logits`). The real Qwen3.5-0.8B-Base and Qwen3.8-Flash-Next
+checkpoints are not qualified yet.
 
 `1.1.0` (`implement-production-qwen-model-loading` task group 8) made this
 Component checkpoint-configurable: architecture dimensions (hidden size,
