@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.13.0;
+package magnetar:model-component-graph@1.14.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -479,6 +479,82 @@ interface model-config {
   /// Added in 1.13.0: `none` keeps the plain forms. A declared value must
   /// be read before a graph is accepted.
   decoder-variants: func() -> option<decoder-variant-config>;
+
+  /// Several residual streams mixed by learned gates (Qwen4-Exp's
+  /// hyper-connections). Added in 1.14.0. The embedding is repeated
+  /// `streams` times along the feature axis; each block reads a gated mix
+  /// of the streams and writes back to every stream through its own
+  /// injection weight. There is no input or post-attention norm, and the
+  /// final mix feeds the LM head directly.
+  record hyper-connection-config {
+    streams: u32,
+    /// Rank of the low-rank input mixer.
+    lowrank: u32,
+  }
+
+  /// Added in 1.14.0: `none` keeps a single residual stream. A declared
+  /// value must be read before a graph is accepted.
+  hyper-connections: func() -> option<hyper-connection-config>;
+
+  /// Hashed n-gram embeddings added before some layers' first block
+  /// (Qwen4-Exp's per-layer embeddings). Added in 1.14.0.
+  record ngram-embedding-config {
+    /// One entry per decoder layer: true where the layer adds its
+    /// embedding.
+    layers: list<bool>,
+    /// Width of the concatenated heads' embeddings.
+    embedding-dim: u64,
+    /// Kernel of the dilated depthwise convolution (the dilation is
+    /// `ngram-size`).
+    conv-kernel: u32,
+    /// The largest n-gram order.
+    ngram-size: u32,
+    /// Independently hashed heads per n-gram order.
+    heads-per-ngram: u32,
+    /// Lower bound of each head's prime vocabulary.
+    vocabulary-base: u64,
+    /// The combined vocabulary is padded to a multiple of this.
+    vocabulary-multiple: u32,
+    /// Seed of the hash multipliers.
+    seed: u64,
+    /// The token that delimits segments.
+    eos-token: u32,
+  }
+
+  /// Added in 1.14.0: `none` when no layer adds an n-gram embedding. A
+  /// declared value must be read before a graph is accepted.
+  ngram-embeddings: func() -> option<ngram-embedding-config>;
+
+  /// A token indexer chooses, for each query, the blocks of keys a
+  /// full-attention layer reads (Qwen4-Exp's QSA). Added in 1.14.0.
+  record token-selection-config {
+    /// Indexer query heads.
+    heads: u32,
+    /// Indexer key heads (one).
+    key-heads: u32,
+    /// Width of an indexer head.
+    head-dimension: u64,
+    /// Tokens selected from complete blocks.
+    budget: u32,
+    /// Tokens averaged into one block.
+    compress-ratio: u32,
+  }
+
+  /// Added in 1.14.0: `none` when every full-attention layer reads every
+  /// earlier key. A declared value must be read before a graph is
+  /// accepted.
+  token-selection: func() -> option<token-selection-config>;
+
+  /// The activation of a gate that scales a normalized value.
+  enum gate-activation {
+    silu,
+    sigmoid,
+  }
+
+  /// The activation of the linear-attention layers' output gate. Added in
+  /// 1.14.0: `none` keeps `silu`. A declared value must be read before a
+  /// graph is accepted.
+  linear-attention-gate: func() -> option<gate-activation>;
 }
 
 /// A separate graph-producing world for one bidirectional encoder pass.
