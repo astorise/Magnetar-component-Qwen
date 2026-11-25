@@ -34,7 +34,7 @@ use magnetar::model_component_graph::graph_builder::{
 };
 use magnetar::model_component_graph::model_config::{
     self, ArchitectureConfig, GateActivation, HyperConnectionConfig, LinearAttentionConfig,
-    MoeConfig,
+    MoeConfig, NgramEmbeddingConfig,
 };
 
 /// Qwen3.5's decoder forms (`model-config` 1.13.0, `support-qwen38-flash-next`),
@@ -52,6 +52,9 @@ struct Variants {
     /// Qwen4-Exp's residual streams (`model-config` 1.14.0): each block
     /// reads a gated mix of them and writes back to every stream.
     hyper: Option<HyperConnectionConfig>,
+    /// Qwen4-Exp's n-gram embeddings: the layers that add one before their
+    /// first block, and its geometry.
+    ngram: Option<NgramEmbeddingConfig>,
     /// The linear layers' output gate is `sigmoid` instead of `silu`.
     sigmoid_gate: bool,
     /// The most tokens a query sees up to which Qwen4-Exp's indexer keeps
@@ -115,9 +118,10 @@ impl Variants {
         // Qwen4-Exp's forms: every declared one is read; the ones this
         // graph does not build yet are refused rather than left out.
         let hyper = model_config::hyper_connections();
+        let ngram = model_config::ngram_embeddings();
         assert!(
-            model_config::ngram_embeddings().is_none(),
-            "the Qwen Component does not build n-gram embeddings yet"
+            ngram.is_none() || hyper.is_some(),
+            "n-gram embeddings are added to residual streams"
         );
         let dense_limit = model_config::token_selection()
             .map(|selection| u64::from(selection.budget) + u64::from(selection.compress_ratio) - 1);
@@ -131,6 +135,7 @@ impl Variants {
             rotary_dimension,
             linear,
             hyper,
+            ngram,
             sigmoid_gate,
             dense_limit,
         }
@@ -199,6 +204,10 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
         | "mlp_hyper.norm" | "mlp_hyper.down" | "mlp_hyper.up" | "mlp_hyper.inject" => {
             format!("layers.{layer}.{suffix}")
         }
+        // Qwen4-Exp's n-gram embedding: the hashed table and the weights
+        // that gate its value into the streams.
+        "ple.table" | "ple.key" | "ple.value" | "ple.norm_key" | "ple.norm_query"
+        | "ple.norm_conv" | "ple.conv1d" => format!("layers.{layer}.{suffix}"),
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
         "router_proj" | "experts_gate_proj" | "experts_up_proj" | "experts_down_proj"
         | "shared_gate_proj" | "shared_up_proj" | "shared_down_proj" | "shared_expert_gate" => {
@@ -222,6 +231,7 @@ fn build_layer(
     moe: Option<&MoeConfig>,
     layer: u64,
     residual_in: &str,
+    token_ids: &str,
     sequence_length: u64,
     kv_append: bool,
 ) -> String {
@@ -233,6 +243,7 @@ fn build_layer(
             hyper,
             layer,
             residual_in,
+            token_ids,
             sequence_length,
             kv_append,
         );
@@ -601,6 +612,103 @@ fn gated_residual(
     (produced.next().expect("a mixed input"), produced.next())
 }
 
+/// What a layer's n-gram embedding adds to the residual streams: the hashed
+/// embedding of each token's n-grams (its two earlier tokens are a recurrent
+/// state, held relative to the end token so that a new sequence's zeros are
+/// the end-token fill), gated by the streams and followed by a dilated
+/// depthwise convolution (its history is a recurrent state too). Returns
+/// the sum with `residual`.
+#[allow(clippy::too_many_arguments)]
+fn build_ngram_embedding(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    hyper: &HyperConnectionConfig,
+    ngram: &NgramEmbeddingConfig,
+    layer: u64,
+    residual: &str,
+    token_ids: &str,
+    sequence_length: u64,
+) -> String {
+    let prefix = format!("layer{layer}");
+    let integer = |name: &str, value: u64| attr(name, AttributeValue::Integer(value as i64));
+    let width = u64::from(hyper.streams) * config.hidden_size;
+    let context_len = u64::from(ngram.ngram_size) - 1;
+    let state_len = u64::from(ngram.conv_kernel - 1) * u64::from(ngram.ngram_size);
+    // Which n-gram embedding this is among the layers that have one.
+    let layer_index = ngram.layers[..layer as usize]
+        .iter()
+        .filter(|has| **has)
+        .count() as u64;
+    let context = recurrent_resource(layer, "ngram_context", &shape(vec![context_len]));
+    let history = recurrent_resource(layer, "ngram_history", &shape(vec![width, state_len]));
+    let embedded = add_node_outputs(
+        &format!("{prefix}.ngram_embedding"),
+        "ngram-embedding",
+        "Tensor",
+        &[
+            integer("ngram_size", u64::from(ngram.ngram_size)),
+            integer("heads_per_ngram", u64::from(ngram.heads_per_ngram)),
+            integer("vocab_size", config.vocabulary_size),
+            integer("vocab_base", ngram.vocabulary_base),
+            integer("layer_index", layer_index),
+            integer("seed", ngram.seed),
+            integer("eos_token_id", u64::from(ngram.eos_token)),
+        ],
+        &[
+            token_ids.to_string(),
+            recurrent_input(&context),
+            weight_edge(&weight_tensor_name(layer, "ple.table")),
+        ],
+        &[
+            shape(vec![sequence_length, ngram.embedding_dim]),
+            shape(vec![context_len]),
+        ],
+    );
+    recurrent_output(&context, &embedded[1]);
+    let mut inputs = vec![residual.to_string(), embedded[0].clone()];
+    for weight in [
+        "ple.key",
+        "ple.value",
+        "ple.norm_key",
+        "ple.norm_query",
+        "ple.norm_conv",
+        "ple.conv1d",
+    ] {
+        inputs.push(weight_edge(&weight_tensor_name(layer, weight)));
+    }
+    inputs.push(recurrent_input(&history));
+    let added = add_node_outputs(
+        &format!("{prefix}.ngram_ple"),
+        "ngram-ple",
+        "LinearAlgebra",
+        &[
+            integer("hc_count", u64::from(hyper.streams)),
+            attr("epsilon", AttributeValue::FloatValue(config.rms_norm_eps)),
+            attr(
+                "weight_offset",
+                AttributeValue::FloatValue(variants.norm_offset),
+            ),
+            integer("conv_kernel", u64::from(ngram.conv_kernel)),
+            integer("conv_dilation", u64::from(ngram.ngram_size)),
+        ],
+        &inputs,
+        &[
+            shape(vec![sequence_length, width]),
+            shape(vec![width, state_len]),
+        ],
+    );
+    recurrent_output(&history, &added[1]);
+    add_node(
+        &format!("{prefix}.ngram_add"),
+        "residual-add",
+        "Tensor",
+        &[],
+        &[residual.to_string(), added[0].clone()],
+        &shape(vec![sequence_length, width]),
+        None,
+    )
+}
+
 /// One Qwen4-Exp decoder layer: the token mixer (gated-delta or attention)
 /// and the mixture of experts, each reading a gated mix of the residual
 /// streams and written back into every stream. No decoder norms.
@@ -612,11 +720,34 @@ fn build_hyper_layer(
     hyper: &HyperConnectionConfig,
     layer: u64,
     residual_in: &str,
+    token_ids: &str,
     sequence_length: u64,
     kv_append: bool,
 ) -> String {
     let prefix = format!("layer{layer}");
     let moe = moe.expect("a Qwen4-Exp layer is a mixture of experts");
+    // An n-gram embedding is added to every stream before the first block.
+    let embedded;
+    let residual_in = match variants
+        .ngram
+        .as_ref()
+        .filter(|ngram| ngram.layers[layer as usize])
+    {
+        Some(ngram) => {
+            embedded = build_ngram_embedding(
+                config,
+                variants,
+                hyper,
+                ngram,
+                layer,
+                residual_in,
+                token_ids,
+                sequence_length,
+            );
+            embedded.as_str()
+        }
+        None => residual_in,
+    };
     let streams_shape = shape(vec![
         sequence_length,
         u64::from(hyper.streams) * config.hidden_size,
@@ -1099,15 +1230,16 @@ fn build_graph_segment(
             "the Qwen Component does not select keys beyond {limit} tokens yet"
         );
     }
+    let mut token_ids = String::new();
     let mut hidden = if start_layer == 0 {
-        let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
+        token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
         let token_embedding = weight_edge("token_embedding");
         let embedded = add_node(
             "embedding",
             "embedding",
             "Tensor",
             &[],
-            &[token_ids, token_embedding],
+            &[token_ids.clone(), token_embedding],
             &shape(vec![sequence_length, config.hidden_size]),
             None,
         );
@@ -1140,6 +1272,7 @@ fn build_graph_segment(
             moe.as_ref(),
             layer,
             &hidden,
+            &token_ids,
             sequence_length,
             kv_append,
         );
