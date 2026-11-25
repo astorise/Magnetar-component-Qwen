@@ -34,7 +34,7 @@ use magnetar::model_component_graph::graph_builder::{
 };
 use magnetar::model_component_graph::model_config::{
     self, ArchitectureConfig, GateActivation, HyperConnectionConfig, LinearAttentionConfig,
-    MoeConfig, NgramEmbeddingConfig,
+    MoeConfig, NgramEmbeddingConfig, TokenSelectionConfig,
 };
 
 /// Qwen3.5's decoder forms (`model-config` 1.13.0, `support-qwen38-flash-next`),
@@ -57,11 +57,9 @@ struct Variants {
     ngram: Option<NgramEmbeddingConfig>,
     /// The linear layers' output gate is `sigmoid` instead of `silu`.
     sigmoid_gate: bool,
-    /// The most tokens a query sees up to which Qwen4-Exp's indexer keeps
-    /// every key, so that dense attention gives its result (`budget +
-    /// compress_ratio - 1`). Beyond it the graph is refused: selecting
-    /// keys is not built yet.
-    dense_limit: Option<u64>,
+    /// Qwen4-Exp's token indexer: every full-attention layer attends the
+    /// tokens it selects (`model-config` 1.14.0).
+    selection: Option<TokenSelectionConfig>,
 }
 
 impl Variants {
@@ -123,8 +121,7 @@ impl Variants {
             ngram.is_none() || hyper.is_some(),
             "n-gram embeddings are added to residual streams"
         );
-        let dense_limit = model_config::token_selection()
-            .map(|selection| u64::from(selection.budget) + u64::from(selection.compress_ratio) - 1);
+        let selection = model_config::token_selection();
         let sigmoid_gate = matches!(
             model_config::linear_attention_gate(),
             Some(GateActivation::Sigmoid)
@@ -137,8 +134,16 @@ impl Variants {
             hyper,
             ngram,
             sigmoid_gate,
-            dense_limit,
+            selection,
         }
+    }
+
+    /// The KV layer holding `layer`'s index keys: the stores follow the
+    /// decoder layers, one per full-attention layer in order (the
+    /// Runtime's `kv_layer_count`).
+    fn index_store(&self, config: &ArchitectureConfig, layer: u64) -> u64 {
+        let earlier = (0..layer).filter(|&other| !self.is_linear(other)).count() as u64;
+        u64::from(config.num_hidden_layers) + earlier
     }
 
     fn is_linear(&self, layer: u64) -> bool {
@@ -194,7 +199,9 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
     match suffix {
         "input_norm" | "post_attn_norm" => format!("layers.{layer}.{suffix}"),
         "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_bias" | "k_bias" | "v_bias" | "q_norm"
-        | "k_norm" => format!("layers.{layer}.self_attn.{suffix}"),
+        | "k_norm" | "index_q_proj" | "index_k_proj" | "index_q_norm" | "index_k_norm" => {
+            format!("layers.{layer}.self_attn.{suffix}")
+        }
         // Qwen3.5's gated-delta mixer, in checkpoint `[out, in]` order.
         "in_qkv" | "in_z" | "in_a" | "in_b" | "conv1d" | "a_log" | "dt_bias" | "norm" | "out" => {
             format!("layers.{layer}.linear_attn.{suffix}")
@@ -401,6 +408,17 @@ fn build_attention_block(
     } else {
         k
     };
+    let selected = variants.selection.as_ref().map(|selection| {
+        build_token_selection(
+            config,
+            variants,
+            selection,
+            layer,
+            normed.clone(),
+            sequence_length,
+            kv_append,
+        )
+    });
     let v_weight = weight_edge(&weight_tensor_name(layer, "v_proj"));
     let v_kv = kv_resource(layer, KvCacheRole::V);
     let v_kv_involvement = KvInvolvement {
@@ -494,30 +512,37 @@ fn build_attention_block(
         }),
     );
 
+    let mut attention_attributes = vec![
+        attr("causal", AttributeValue::Boolean(true)),
+        attr(
+            "head_count",
+            AttributeValue::Integer(attention_head_count as i64),
+        ),
+        attr(
+            "kv_head_count",
+            AttributeValue::Integer(kv_head_count as i64),
+        ),
+        attr(
+            "head_dimension",
+            AttributeValue::Integer(head_dimension as i64),
+        ),
+        attr(
+            "attention_mask_kind",
+            AttributeValue::Text("causal".to_string()),
+        ),
+    ];
+    let mut attention_inputs = vec![q_rope, k_rope, v];
+    // The indexer's selection is the attention's fourth input.
+    if let Some(selected) = selected {
+        attention_attributes.push(attr("token_selection", AttributeValue::Boolean(true)));
+        attention_inputs.push(selected);
+    }
     let attn_out = add_node(
         &format!("{prefix}.attention"),
         "attention",
         "Attention",
-        &[
-            attr("causal", AttributeValue::Boolean(true)),
-            attr(
-                "head_count",
-                AttributeValue::Integer(attention_head_count as i64),
-            ),
-            attr(
-                "kv_head_count",
-                AttributeValue::Integer(kv_head_count as i64),
-            ),
-            attr(
-                "head_dimension",
-                AttributeValue::Integer(head_dimension as i64),
-            ),
-            attr(
-                "attention_mask_kind",
-                AttributeValue::Text("causal".to_string()),
-            ),
-        ],
-        &[q_rope, k_rope, v],
+        &attention_attributes,
+        &attention_inputs,
         &shape(vec![sequence_length, q_dim]),
         None,
     );
@@ -880,6 +905,30 @@ fn per_head_norm(
     head_count: u64,
     sequence_length: u64,
 ) -> String {
+    head_norm(
+        config,
+        variants,
+        node_id,
+        input,
+        weight_name,
+        head_count,
+        config.head_dimension,
+        sequence_length,
+    )
+}
+
+/// An RMSNorm over each of `head_count` heads of `head_dimension` values.
+#[allow(clippy::too_many_arguments)]
+fn head_norm(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    node_id: &str,
+    input: String,
+    weight_name: &str,
+    head_count: u64,
+    head_dimension: u64,
+    sequence_length: u64,
+) -> String {
     let mut attributes = variants.norm(config.rms_norm_eps);
     attributes.push(attr(
         "head_count",
@@ -887,7 +936,7 @@ fn per_head_norm(
     ));
     attributes.push(attr(
         "head_dimension",
-        AttributeValue::Integer(config.head_dimension as i64),
+        AttributeValue::Integer(head_dimension as i64),
     ));
     add_node(
         node_id,
@@ -895,7 +944,127 @@ fn per_head_norm(
         "Normalization",
         &attributes,
         &[input, weight_edge(weight_name)],
-        &shape(vec![sequence_length, head_count * config.head_dimension]),
+        &shape(vec![sequence_length, head_count * head_dimension]),
+        None,
+    )
+}
+
+/// Qwen4-Exp's token indexer for one full-attention layer
+/// (`Qwen4ExpTextQSAIndexer`): queries from the layer's input are normalized
+/// per head and rotated, the raw key of each token joins the layer's index
+/// store, and `qsa-select` returns, per query, the positions it attends.
+fn build_token_selection(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    selection: &TokenSelectionConfig,
+    layer: u64,
+    normed: String,
+    sequence_length: u64,
+    kv_append: bool,
+) -> String {
+    assert_eq!(selection.key_heads, 1, "the indexer has one key head");
+    let prefix = format!("layer{layer}.indexer");
+    let heads = u64::from(selection.heads);
+    let dim = selection.head_dimension;
+    let rotary = variants.rotary_dimension.unwrap_or(config.head_dimension);
+    assert!(
+        rotary <= dim && rotary.is_multiple_of(2),
+        "the indexer rotates the first {rotary} values of a {dim}-wide head"
+    );
+    let q = add_node(
+        &format!("{prefix}.q_proj"),
+        "matmul",
+        "LinearAlgebra",
+        &[],
+        &[
+            normed.clone(),
+            weight_edge(&weight_tensor_name(layer, "index_q_proj")),
+        ],
+        &shape(vec![sequence_length, heads * dim]),
+        None,
+    );
+    let q = head_norm(
+        config,
+        variants,
+        &format!("{prefix}.q_norm"),
+        q,
+        &weight_tensor_name(layer, "index_q_norm"),
+        heads,
+        dim,
+        sequence_length,
+    );
+    let q = add_node(
+        &format!("{prefix}.rope_q"),
+        "rope",
+        "PositionEncoding",
+        &[
+            attr("base", AttributeValue::FloatValue(config.rope_theta)),
+            attr("dimension", AttributeValue::Integer(rotary as i64)),
+            attr(
+                "position_mode",
+                AttributeValue::Text(ROPE_POSITION_MODE.to_string()),
+            ),
+            attr(
+                "rotation_pairing",
+                AttributeValue::Text(ROPE_ROTATION_PAIRING.to_string()),
+            ),
+            attr("position_offset", AttributeValue::Integer(0)),
+            attr("head_count", AttributeValue::Integer(heads as i64)),
+        ],
+        &[q],
+        &shape(vec![sequence_length, heads * dim]),
+        None,
+    );
+    // The raw keys of every token so far: the cache holds the history, and
+    // every consumer of this edge reads all of it.
+    let keys = add_node(
+        &format!("{prefix}.k_proj"),
+        "matmul",
+        "LinearAlgebra",
+        &[],
+        &[
+            normed,
+            weight_edge(&weight_tensor_name(layer, "index_k_proj")),
+        ],
+        &shape(vec![sequence_length, dim]),
+        Some(&KvInvolvement {
+            resource_id: kv_resource(variants.index_store(config, layer), KvCacheRole::K),
+            role: KvCacheRole::K,
+            append: kv_append,
+        }),
+    );
+    add_node(
+        &format!("{prefix}.select"),
+        "qsa-select",
+        "Tensor",
+        &[
+            attr("head_count", AttributeValue::Integer(heads as i64)),
+            attr("head_dim", AttributeValue::Integer(dim as i64)),
+            attr(
+                "compress_ratio",
+                AttributeValue::Integer(i64::from(selection.compress_ratio)),
+            ),
+            attr(
+                "budget",
+                AttributeValue::Integer(i64::from(selection.budget)),
+            ),
+            attr("rotary_dim", AttributeValue::Integer(rotary as i64)),
+            attr("epsilon", AttributeValue::FloatValue(config.rms_norm_eps)),
+            attr("rope_base", AttributeValue::FloatValue(config.rope_theta)),
+            attr(
+                "weight_offset",
+                AttributeValue::FloatValue(variants.norm_offset),
+            ),
+        ],
+        &[
+            q,
+            keys,
+            weight_edge(&weight_tensor_name(layer, "index_k_norm")),
+        ],
+        &shape(vec![
+            sequence_length,
+            u64::from(selection.budget) + u64::from(selection.compress_ratio) - 1,
+        ]),
         None,
     )
 }
@@ -1222,12 +1391,6 @@ fn build_graph_segment(
         assert!(
             start_layer == 0 && end_layer == config.num_hidden_layers,
             "the Qwen Component builds Qwen4-Exp's residual streams only as a whole graph"
-        );
-    }
-    if let Some(limit) = variants.dense_limit {
-        assert!(
-            position_offset + sequence_length <= limit,
-            "the Qwen Component does not select keys beyond {limit} tokens yet"
         );
     }
     let mut token_ids = String::new();

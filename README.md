@@ -66,9 +66,16 @@ on top of those forms:
   (`output_gate_type`); the full-attention layers are the gated Qwen3.5 ones.
 - **Experts:** every layer is a mixture of experts with a shared expert
   behind a sigmoid gate.
-- **Not built yet:** the token indexer's selection (attention is dense, which
-  gives the indexer's result up to `budget + ratio - 1` visible tokens, and
-  a longer graph is refused) and the n-gram embeddings (refused).
+- **Token indexer:** each full-attention layer projects its input through
+  the indexer's query and key projections, normalizes and rotates the
+  queries per head, appends the raw key to the layer's index store (a KV
+  store numbered after the decoder layers) and runs `qsa-select` over every
+  key so far. The kept positions are the attention's fourth input
+  (`token_selection`), so a query attends at most `budget + ratio - 1`
+  tokens, and the same graph is dense for shorter contexts.
+- **N-gram embeddings:** a layer that declares one adds a hashed n-gram
+  embedding to every stream before its first block, with its token context and
+  convolution history as recurrent states.
 
 A tiny random Qwen3.5 checkpoint matches `transformers` in the main
 repository's `integration-tests/production-loading`
