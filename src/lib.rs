@@ -29,9 +29,136 @@ wit_bindgen::generate!({
 
 use magnetar::model_component_graph::graph_builder::{
     Attribute, AttributeValue, GraphPhase, KvCacheRole, KvInvolvement, TensorShape, add_node,
-    alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource, weight_edge,
+    add_node_outputs, alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource,
+    recurrent_input, recurrent_output, recurrent_resource, weight_edge,
 };
-use magnetar::model_component_graph::model_config::{self, ArchitectureConfig, MoeConfig};
+use magnetar::model_component_graph::model_config::{
+    self, ArchitectureConfig, GateActivation, HyperConnectionConfig, LinearAttentionConfig,
+    MoeConfig, NgramEmbeddingConfig,
+};
+
+/// Qwen3.5's decoder forms (`model-config` 1.13.0, `support-qwen38-flash-next`),
+/// read once per graph: all neutral for a Qwen2/2.5 checkpoint.
+struct Variants {
+    /// Every decoder RMSNorm scales by `norm_offset + weight`.
+    norm_offset: f64,
+    /// Each attention head's query projection is followed by its gate, and
+    /// the query and key are normalized per head (Qwen3.5's attention).
+    gated_attention: bool,
+    /// The width of each head that rotates, when only part of it does.
+    rotary_dimension: Option<u64>,
+    /// The gated-delta linear-attention layers, if the decoder is hybrid.
+    linear: Option<LinearAttentionConfig>,
+    /// Qwen4-Exp's residual streams (`model-config` 1.14.0): each block
+    /// reads a gated mix of them and writes back to every stream.
+    hyper: Option<HyperConnectionConfig>,
+    /// Qwen4-Exp's n-gram embeddings: the layers that add one before their
+    /// first block, and its geometry.
+    ngram: Option<NgramEmbeddingConfig>,
+    /// The linear layers' output gate is `sigmoid` instead of `silu`.
+    sigmoid_gate: bool,
+    /// The most tokens a query sees up to which Qwen4-Exp's indexer keeps
+    /// every key, so that dense attention gives its result (`budget +
+    /// compress_ratio - 1`). Beyond it the graph is refused: selecting
+    /// keys is not built yet.
+    dense_limit: Option<u64>,
+}
+
+impl Variants {
+    fn read(config: &ArchitectureConfig) -> Self {
+        let variants = model_config::decoder_variants();
+        let linear = model_config::linear_attention();
+        // Only Qwen3.5's decoder reads the layer layout, for its partial
+        // rotary: a Qwen2 graph leaves a declared layout unread, so the
+        // Runtime refuses it instead of running it without its windows.
+        let hybrid = variants.is_some() || linear.is_some();
+        // A Qwen3.5 layout: uniform full-attention layers whose rotary may
+        // be partial, and nothing else.
+        let layout = if hybrid {
+            model_config::layer_layout()
+        } else {
+            None
+        };
+        let rotary_dimension = layout.and_then(|layout| {
+            assert_eq!(
+                layout.len(),
+                config.num_hidden_layers as usize,
+                "the layer layout must have one entry per layer"
+            );
+            let first = &layout[0];
+            for layer in &layout {
+                assert!(
+                    layer.sliding_window.is_none()
+                        && layer.kv_source_layer.is_none()
+                        && !layer.value_from_key
+                        && layer.head_dimension == config.head_dimension
+                        && layer.num_key_value_heads == config.num_key_value_heads
+                        && layer.intermediate_size == config.intermediate_size
+                        && layer.rope_theta == config.rope_theta
+                        && layer.partial_rotary_factor == first.partial_rotary_factor,
+                    "the Qwen Component implements uniform full-attention layers only"
+                );
+            }
+            first.partial_rotary_factor.map(|factor| {
+                let dimension = (config.head_dimension as f64 * factor) as u64;
+                assert!(
+                    dimension > 0 && dimension.is_multiple_of(2),
+                    "the rotary dimension must be positive and even"
+                );
+                dimension
+            })
+        });
+        if let Some(linear) = &linear {
+            assert_eq!(
+                linear.layers.len(),
+                config.num_hidden_layers as usize,
+                "linear attention must name every layer"
+            );
+        }
+        // Qwen4-Exp's forms: every declared one is read; the ones this
+        // graph does not build yet are refused rather than left out.
+        let hyper = model_config::hyper_connections();
+        let ngram = model_config::ngram_embeddings();
+        assert!(
+            ngram.is_none() || hyper.is_some(),
+            "n-gram embeddings are added to residual streams"
+        );
+        let dense_limit = model_config::token_selection()
+            .map(|selection| u64::from(selection.budget) + u64::from(selection.compress_ratio) - 1);
+        let sigmoid_gate = matches!(
+            model_config::linear_attention_gate(),
+            Some(GateActivation::Sigmoid)
+        );
+        Self {
+            norm_offset: variants.as_ref().map_or(0.0, |v| v.norm_weight_offset),
+            gated_attention: variants.is_some_and(|v| v.attention_output_gate),
+            rotary_dimension,
+            linear,
+            hyper,
+            ngram,
+            sigmoid_gate,
+            dense_limit,
+        }
+    }
+
+    fn is_linear(&self, layer: u64) -> bool {
+        self.linear
+            .as_ref()
+            .is_some_and(|linear| linear.layers[layer as usize])
+    }
+
+    /// An RMSNorm node's attributes.
+    fn norm(&self, epsilon: f64) -> Vec<Attribute> {
+        let mut attributes = vec![attr("epsilon", AttributeValue::FloatValue(epsilon))];
+        if self.norm_offset != 0.0 {
+            attributes.push(attr(
+                "weight_offset",
+                AttributeValue::FloatValue(self.norm_offset),
+            ));
+        }
+        attributes
+    }
+}
 
 const ROPE_POSITION_MODE: &str = "sequential";
 const ROPE_ROTATION_PAIRING: &str = "half_split";
@@ -66,9 +193,21 @@ fn attr(name: &str, value: AttributeValue) -> Attribute {
 fn weight_tensor_name(layer: u64, suffix: &str) -> String {
     match suffix {
         "input_norm" | "post_attn_norm" => format!("layers.{layer}.{suffix}"),
-        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_bias" | "k_bias" | "v_bias" => {
-            format!("layers.{layer}.self_attn.{suffix}")
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_bias" | "k_bias" | "v_bias" | "q_norm"
+        | "k_norm" => format!("layers.{layer}.self_attn.{suffix}"),
+        // Qwen3.5's gated-delta mixer, in checkpoint `[out, in]` order.
+        "in_qkv" | "in_z" | "in_a" | "in_b" | "conv1d" | "a_log" | "dt_bias" | "norm" | "out" => {
+            format!("layers.{layer}.linear_attn.{suffix}")
         }
+        // Qwen4-Exp's gated residuals, in checkpoint `[out, in]` order.
+        "attn_hyper.norm" | "attn_hyper.down" | "attn_hyper.up" | "attn_hyper.inject"
+        | "mlp_hyper.norm" | "mlp_hyper.down" | "mlp_hyper.up" | "mlp_hyper.inject" => {
+            format!("layers.{layer}.{suffix}")
+        }
+        // Qwen4-Exp's n-gram embedding: the hashed table and the weights
+        // that gate its value into the streams.
+        "ple.table" | "ple.key" | "ple.value" | "ple.norm_key" | "ple.norm_query"
+        | "ple.norm_conv" | "ple.conv1d" => format!("layers.{layer}.{suffix}"),
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
         "router_proj" | "experts_gate_proj" | "experts_up_proj" | "experts_down_proj"
         | "shared_gate_proj" | "shared_up_proj" | "shared_down_proj" | "shared_expert_gate" => {
@@ -88,34 +227,75 @@ fn weight_tensor_name(layer: u64, suffix: &str) -> String {
 /// constant.
 fn build_layer(
     config: &ArchitectureConfig,
+    variants: &Variants,
     moe: Option<&MoeConfig>,
     layer: u64,
     residual_in: &str,
+    token_ids: &str,
     sequence_length: u64,
     kv_append: bool,
 ) -> String {
+    if let Some(hyper) = &variants.hyper {
+        return build_hyper_layer(
+            config,
+            variants,
+            moe,
+            hyper,
+            layer,
+            residual_in,
+            token_ids,
+            sequence_length,
+            kv_append,
+        );
+    }
     let prefix = format!("layer{layer}");
     let hidden_size = config.hidden_size;
-    let intermediate_size = config.intermediate_size;
-    let attention_head_count = config.num_attention_heads as u64;
-    let kv_head_count = config.num_key_value_heads as u64;
-    let head_dimension = config.head_dimension;
-    let q_dim = attention_head_count * head_dimension;
-    let kv_dim = kv_head_count * head_dimension;
 
     let input_norm_weight = weight_edge(&weight_tensor_name(layer, "input_norm"));
     let normed = add_node(
         &format!("{prefix}.input_norm"),
         "rmsnorm",
         "Normalization",
-        &[attr(
-            "epsilon",
-            AttributeValue::FloatValue(config.rms_norm_eps),
-        )],
+        &variants.norm(config.rms_norm_eps),
         &[residual_in.to_string(), input_norm_weight],
         &shape(vec![sequence_length, hidden_size]),
         None,
     );
+    let attn_proj = if variants.is_linear(layer) {
+        build_linear_mixer(config, variants, layer, normed, sequence_length)
+    } else {
+        build_attention_block(config, variants, layer, normed, sequence_length, kv_append)
+    };
+    finish_layer(
+        config,
+        variants,
+        moe,
+        layer,
+        residual_in,
+        attn_proj,
+        sequence_length,
+    )
+}
+
+/// A full-attention layer's token mixer: the query, key and value
+/// projections (their biases and Qwen3.5's per-head norms and gate), RoPE,
+/// attention over the KV history and the output projection. `normed` is
+/// the block's input, `[sequence_length, hidden_size]`.
+fn build_attention_block(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    layer: u64,
+    normed: String,
+    sequence_length: u64,
+    kv_append: bool,
+) -> String {
+    let prefix = format!("layer{layer}");
+    let hidden_size = config.hidden_size;
+    let attention_head_count = config.num_attention_heads as u64;
+    let kv_head_count = config.num_key_value_heads as u64;
+    let head_dimension = config.head_dimension;
+    let q_dim = attention_head_count * head_dimension;
+    let kv_dim = kv_head_count * head_dimension;
 
     // Real Qwen2/2.5 checkpoints declare an additive bias term for
     // q/k/v_proj (an architectural default, not `config.json`-driven --
@@ -127,15 +307,49 @@ fn build_layer(
     // matmul's) becomes `q`/`k`/`v` below, and the v-projection's KV
     // involvement attaches to whichever node is actually last.
     let q_weight = weight_edge(&weight_tensor_name(layer, "q_proj"));
+    // Qwen3.5's query projection holds, per head, the query then its gate.
+    let q_width = if variants.gated_attention {
+        2 * q_dim
+    } else {
+        q_dim
+    };
     let q = add_node(
         &format!("{prefix}.q_proj"),
         "matmul",
         "LinearAlgebra",
         &[],
         &[normed.clone(), q_weight],
-        &shape(vec![sequence_length, q_dim]),
+        &shape(vec![sequence_length, q_width]),
         None,
     );
+    let (q, gate) = if variants.gated_attention {
+        let halves = add_node_outputs(
+            &format!("{prefix}.q_gate_split"),
+            "split",
+            "Tensor",
+            &[attr(
+                "head_count",
+                AttributeValue::Integer(attention_head_count as i64),
+            )],
+            &[q],
+            &[
+                shape(vec![sequence_length, q_dim]),
+                shape(vec![sequence_length, q_dim]),
+            ],
+        );
+        let q = per_head_norm(
+            config,
+            variants,
+            &format!("{prefix}.q_norm"),
+            halves[0].clone(),
+            &weight_tensor_name(layer, "q_norm"),
+            attention_head_count,
+            sequence_length,
+        );
+        (q, Some(halves[1].clone()))
+    } else {
+        (q, None)
+    };
     let q = if config.attention_bias {
         let q_bias = weight_edge(&weight_tensor_name(layer, "q_bias"));
         add_node(
@@ -170,6 +384,19 @@ fn build_layer(
             &[k, k_bias],
             &shape(vec![sequence_length, kv_dim]),
             None,
+        )
+    } else {
+        k
+    };
+    let k = if variants.gated_attention {
+        per_head_norm(
+            config,
+            variants,
+            &format!("{prefix}.k_norm"),
+            k,
+            &weight_tensor_name(layer, "k_norm"),
+            kv_head_count,
+            sequence_length,
         )
     } else {
         k
@@ -222,7 +449,12 @@ fn build_layer(
     let rope_attrs = |offset: i64, head_count: u64| {
         vec![
             attr("base", AttributeValue::FloatValue(config.rope_theta)),
-            attr("dimension", AttributeValue::Integer(head_dimension as i64)),
+            // A partial rotary rotates the first `rotary_dimension` values
+            // of each head, in half-split pairs within them.
+            attr(
+                "dimension",
+                AttributeValue::Integer(variants.rotary_dimension.unwrap_or(head_dimension) as i64),
+            ),
             attr(
                 "position_mode",
                 AttributeValue::Text(ROPE_POSITION_MODE.to_string()),
@@ -289,9 +521,33 @@ fn build_layer(
         &shape(vec![sequence_length, q_dim]),
         None,
     );
+    // Qwen3.5 multiplies the attention output by its gate's sigmoid.
+    let attn_out = match gate {
+        Some(gate) => {
+            let gate = add_node(
+                &format!("{prefix}.gate_sigmoid"),
+                "activation",
+                "Activation",
+                &[attr("kind", AttributeValue::Text("sigmoid".to_string()))],
+                &[gate],
+                &shape(vec![sequence_length, q_dim]),
+                None,
+            );
+            add_node(
+                &format!("{prefix}.gated"),
+                "mul",
+                "Tensor",
+                &[],
+                &[attn_out, gate],
+                &shape(vec![sequence_length, q_dim]),
+                None,
+            )
+        }
+        None => attn_out,
+    };
 
     let o_weight = weight_edge(&weight_tensor_name(layer, "o_proj"));
-    let attn_proj = add_node(
+    add_node(
         &format!("{prefix}.o_proj"),
         "matmul",
         "LinearAlgebra",
@@ -299,8 +555,269 @@ fn build_layer(
         &[attn_out, o_weight],
         &shape(vec![sequence_length, hidden_size]),
         None,
-    );
+    )
+}
 
+/// One gated residual over the streams `residual` (`[T, streams *
+/// hidden]`): the block's input `[T, hidden]` and, with `inject`, the
+/// weights the block's output is written back with `[T, streams]`.
+#[allow(clippy::too_many_arguments)]
+fn gated_residual(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    hyper: &HyperConnectionConfig,
+    node_id: &str,
+    weights: &str,
+    residual: &str,
+    sequence_length: u64,
+    inject: bool,
+) -> (String, Option<String>) {
+    let weight = |part: &str| weight_edge(&format!("{weights}.{part}"));
+    let mut inputs = vec![
+        residual.to_string(),
+        weight("norm"),
+        weight("down"),
+        weight("up"),
+    ];
+    let mut outputs = vec![shape(vec![sequence_length, config.hidden_size])];
+    if inject {
+        inputs.push(weight("inject"));
+        outputs.push(shape(vec![sequence_length, u64::from(hyper.streams)]));
+    }
+    let attributes = [
+        attr(
+            "hc_count",
+            AttributeValue::Integer(i64::from(hyper.streams)),
+        ),
+        attr("epsilon", AttributeValue::FloatValue(config.rms_norm_eps)),
+        attr(
+            "weight_offset",
+            AttributeValue::FloatValue(variants.norm_offset),
+        ),
+    ];
+    let operator = if inject {
+        "gated-residual"
+    } else {
+        "gated-residual-final"
+    };
+    let mut produced = add_node_outputs(
+        node_id,
+        operator,
+        "LinearAlgebra",
+        &attributes,
+        &inputs,
+        &outputs,
+    )
+    .into_iter();
+    (produced.next().expect("a mixed input"), produced.next())
+}
+
+/// What a layer's n-gram embedding adds to the residual streams: the hashed
+/// embedding of each token's n-grams (its two earlier tokens are a recurrent
+/// state, held relative to the end token so that a new sequence's zeros are
+/// the end-token fill), gated by the streams and followed by a dilated
+/// depthwise convolution (its history is a recurrent state too). Returns
+/// the sum with `residual`.
+#[allow(clippy::too_many_arguments)]
+fn build_ngram_embedding(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    hyper: &HyperConnectionConfig,
+    ngram: &NgramEmbeddingConfig,
+    layer: u64,
+    residual: &str,
+    token_ids: &str,
+    sequence_length: u64,
+) -> String {
+    let prefix = format!("layer{layer}");
+    let integer = |name: &str, value: u64| attr(name, AttributeValue::Integer(value as i64));
+    let width = u64::from(hyper.streams) * config.hidden_size;
+    let context_len = u64::from(ngram.ngram_size) - 1;
+    let state_len = u64::from(ngram.conv_kernel - 1) * u64::from(ngram.ngram_size);
+    // Which n-gram embedding this is among the layers that have one.
+    let layer_index = ngram.layers[..layer as usize]
+        .iter()
+        .filter(|has| **has)
+        .count() as u64;
+    let context = recurrent_resource(layer, "ngram_context", &shape(vec![context_len]));
+    let history = recurrent_resource(layer, "ngram_history", &shape(vec![width, state_len]));
+    let embedded = add_node_outputs(
+        &format!("{prefix}.ngram_embedding"),
+        "ngram-embedding",
+        "Tensor",
+        &[
+            integer("ngram_size", u64::from(ngram.ngram_size)),
+            integer("heads_per_ngram", u64::from(ngram.heads_per_ngram)),
+            integer("vocab_size", config.vocabulary_size),
+            integer("vocab_base", ngram.vocabulary_base),
+            integer("layer_index", layer_index),
+            integer("seed", ngram.seed),
+            integer("eos_token_id", u64::from(ngram.eos_token)),
+        ],
+        &[
+            token_ids.to_string(),
+            recurrent_input(&context),
+            weight_edge(&weight_tensor_name(layer, "ple.table")),
+        ],
+        &[
+            shape(vec![sequence_length, ngram.embedding_dim]),
+            shape(vec![context_len]),
+        ],
+    );
+    recurrent_output(&context, &embedded[1]);
+    let mut inputs = vec![residual.to_string(), embedded[0].clone()];
+    for weight in [
+        "ple.key",
+        "ple.value",
+        "ple.norm_key",
+        "ple.norm_query",
+        "ple.norm_conv",
+        "ple.conv1d",
+    ] {
+        inputs.push(weight_edge(&weight_tensor_name(layer, weight)));
+    }
+    inputs.push(recurrent_input(&history));
+    let added = add_node_outputs(
+        &format!("{prefix}.ngram_ple"),
+        "ngram-ple",
+        "LinearAlgebra",
+        &[
+            integer("hc_count", u64::from(hyper.streams)),
+            attr("epsilon", AttributeValue::FloatValue(config.rms_norm_eps)),
+            attr(
+                "weight_offset",
+                AttributeValue::FloatValue(variants.norm_offset),
+            ),
+            integer("conv_kernel", u64::from(ngram.conv_kernel)),
+            integer("conv_dilation", u64::from(ngram.ngram_size)),
+        ],
+        &inputs,
+        &[
+            shape(vec![sequence_length, width]),
+            shape(vec![width, state_len]),
+        ],
+    );
+    recurrent_output(&history, &added[1]);
+    add_node(
+        &format!("{prefix}.ngram_add"),
+        "residual-add",
+        "Tensor",
+        &[],
+        &[residual.to_string(), added[0].clone()],
+        &shape(vec![sequence_length, width]),
+        None,
+    )
+}
+
+/// One Qwen4-Exp decoder layer: the token mixer (gated-delta or attention)
+/// and the mixture of experts, each reading a gated mix of the residual
+/// streams and written back into every stream. No decoder norms.
+#[allow(clippy::too_many_arguments)]
+fn build_hyper_layer(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    moe: Option<&MoeConfig>,
+    hyper: &HyperConnectionConfig,
+    layer: u64,
+    residual_in: &str,
+    token_ids: &str,
+    sequence_length: u64,
+    kv_append: bool,
+) -> String {
+    let prefix = format!("layer{layer}");
+    let moe = moe.expect("a Qwen4-Exp layer is a mixture of experts");
+    // An n-gram embedding is added to every stream before the first block.
+    let embedded;
+    let residual_in = match variants
+        .ngram
+        .as_ref()
+        .filter(|ngram| ngram.layers[layer as usize])
+    {
+        Some(ngram) => {
+            embedded = build_ngram_embedding(
+                config,
+                variants,
+                hyper,
+                ngram,
+                layer,
+                residual_in,
+                token_ids,
+                sequence_length,
+            );
+            embedded.as_str()
+        }
+        None => residual_in,
+    };
+    let streams_shape = shape(vec![
+        sequence_length,
+        u64::from(hyper.streams) * config.hidden_size,
+    ]);
+    let write_back = |name: &str, residual: &str, block: String, write: Option<String>| {
+        add_node(
+            &format!("{prefix}.{name}_inject"),
+            "gated-residual-inject",
+            "Tensor",
+            &[],
+            &[
+                residual.to_string(),
+                block,
+                write.expect("a block's gated residual writes back"),
+            ],
+            &streams_shape,
+            None,
+        )
+    };
+    let (mixed, write) = gated_residual(
+        config,
+        variants,
+        hyper,
+        &format!("{prefix}.attn_hyper"),
+        &format!("layers.{layer}.attn_hyper"),
+        residual_in,
+        sequence_length,
+        true,
+    );
+    let mixer = if variants.is_linear(layer) {
+        build_linear_mixer(config, variants, layer, mixed, sequence_length)
+    } else {
+        build_attention_block(config, variants, layer, mixed, sequence_length, kv_append)
+    };
+    let residual = write_back("attn", residual_in, mixer, write);
+    let (mixed, write) = gated_residual(
+        config,
+        variants,
+        hyper,
+        &format!("{prefix}.mlp_hyper"),
+        &format!("layers.{layer}.mlp_hyper"),
+        &residual,
+        sequence_length,
+        true,
+    );
+    let experts = moe_mlp(
+        &prefix,
+        layer,
+        moe,
+        mixed,
+        sequence_length,
+        config.hidden_size,
+    );
+    write_back("mlp", &residual, experts, write)
+}
+
+/// The rest of a decoder layer after its token mixer (attention or the
+/// linear mixer): residual, post-mixer norm, MLP, residual.
+fn finish_layer(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    moe: Option<&MoeConfig>,
+    layer: u64,
+    residual_in: &str,
+    attn_proj: String,
+    sequence_length: u64,
+) -> String {
+    let prefix = format!("layer{layer}");
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
     let post_attn = add_node(
         &format!("{prefix}.residual1"),
         "residual-add",
@@ -316,10 +833,7 @@ fn build_layer(
         &format!("{prefix}.post_attn_norm"),
         "rmsnorm",
         "Normalization",
-        &[attr(
-            "epsilon",
-            AttributeValue::FloatValue(config.rms_norm_eps),
-        )],
+        &variants.norm(config.rms_norm_eps),
         &[post_attn.clone(), post_attn_norm_weight],
         &shape(vec![sequence_length, hidden_size]),
         None,
@@ -353,6 +867,102 @@ fn build_layer(
         &shape(vec![sequence_length, hidden_size]),
         None,
     )
+}
+
+/// Qwen3.5's per-head query/key RMSNorm (zero-centered when the decoder's
+/// norms are).
+fn per_head_norm(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    node_id: &str,
+    input: String,
+    weight_name: &str,
+    head_count: u64,
+    sequence_length: u64,
+) -> String {
+    let mut attributes = variants.norm(config.rms_norm_eps);
+    attributes.push(attr(
+        "head_count",
+        AttributeValue::Integer(head_count as i64),
+    ));
+    attributes.push(attr(
+        "head_dimension",
+        AttributeValue::Integer(config.head_dimension as i64),
+    ));
+    add_node(
+        node_id,
+        "rmsnorm",
+        "Normalization",
+        &attributes,
+        &[input, weight_edge(weight_name)],
+        &shape(vec![sequence_length, head_count * config.head_dimension]),
+        None,
+    )
+}
+
+/// One Qwen3.5 gated-delta linear-attention mixer: a `gated-delta-mixer`
+/// node whose convolution (`conv`) and recurrent (`delta`) states are
+/// recurrent resources the Runtime keeps between steps. It has no KV.
+fn build_linear_mixer(
+    config: &ArchitectureConfig,
+    variants: &Variants,
+    layer: u64,
+    normed: String,
+    sequence_length: u64,
+) -> String {
+    let linear = variants
+        .linear
+        .as_ref()
+        .expect("a linear layer has a config");
+    let keys = u64::from(linear.key_heads) * linear.key_head_dimension;
+    let value_heads = u64::from(linear.value_heads);
+    let values = value_heads * linear.value_head_dimension;
+    let channels = 2 * keys + values;
+    let conv_shape = shape(vec![channels, u64::from(linear.conv_kernel)]);
+    let delta_shape = shape(vec![
+        value_heads,
+        linear.key_head_dimension,
+        linear.value_head_dimension,
+    ]);
+    let conv = recurrent_resource(layer, "conv", &conv_shape);
+    let delta = recurrent_resource(layer, "delta", &delta_shape);
+    let mut inputs = vec![normed, recurrent_input(&conv), recurrent_input(&delta)];
+    for weight in [
+        "in_qkv", "in_z", "in_a", "in_b", "conv1d", "a_log", "dt_bias", "norm", "out",
+    ] {
+        inputs.push(weight_edge(&weight_tensor_name(layer, weight)));
+    }
+    let integer = |name: &str, value: u64| attr(name, AttributeValue::Integer(value as i64));
+    let mut attributes = vec![
+        integer("key_heads", u64::from(linear.key_heads)),
+        integer("value_heads", value_heads),
+        integer("key_dim", linear.key_head_dimension),
+        integer("value_dim", linear.value_head_dimension),
+        integer("conv_kernel", u64::from(linear.conv_kernel)),
+        attr("epsilon", AttributeValue::FloatValue(config.rms_norm_eps)),
+    ];
+    // Qwen4-Exp's sigmoid output gate; `silu` is the operator's default.
+    if variants.sigmoid_gate {
+        attributes.push(attr(
+            "output_gate_type",
+            AttributeValue::Text("sigmoid".to_string()),
+        ));
+    }
+    let outputs = add_node_outputs(
+        &format!("layer{layer}.linear_attn"),
+        "gated-delta-mixer",
+        "LinearAlgebra",
+        &attributes,
+        &inputs,
+        &[
+            shape(vec![sequence_length, config.hidden_size]),
+            conv_shape,
+            delta_shape,
+        ],
+    );
+    recurrent_output(&conv, &outputs[1]);
+    recurrent_output(&delta, &outputs[2]);
+    outputs[0].clone()
 }
 
 /// The dense gated MLP: `down(silu(gate(h)) * up(h))`, declared
@@ -599,20 +1209,55 @@ fn build_graph_segment(
         "the Qwen Component does not apply a per-frequency RoPE scaling"
     );
     let moe = model_config::mixture_of_experts();
+    let variants = Variants::read(&config);
     begin_graph(phase, sequence_length, position_offset);
 
+    // The residual's width: one stream, or the streams side by side.
+    let streams = variants
+        .hyper
+        .as_ref()
+        .map_or(1, |hyper| u64::from(hyper.streams));
+    if variants.hyper.is_some() {
+        // A segment would hand the streams to the next one; not built yet.
+        assert!(
+            start_layer == 0 && end_layer == config.num_hidden_layers,
+            "the Qwen Component builds Qwen4-Exp's residual streams only as a whole graph"
+        );
+    }
+    if let Some(limit) = variants.dense_limit {
+        assert!(
+            position_offset + sequence_length <= limit,
+            "the Qwen Component does not select keys beyond {limit} tokens yet"
+        );
+    }
+    let mut token_ids = String::new();
     let mut hidden = if start_layer == 0 {
-        let token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
+        token_ids = declare_input("token_ids", &shape(vec![sequence_length]));
         let token_embedding = weight_edge("token_embedding");
-        add_node(
+        let embedded = add_node(
             "embedding",
             "embedding",
             "Tensor",
             &[],
-            &[token_ids, token_embedding],
+            &[token_ids.clone(), token_embedding],
             &shape(vec![sequence_length, config.hidden_size]),
             None,
-        )
+        );
+        match &variants.hyper {
+            Some(hyper) => add_node(
+                "repeat_streams",
+                "repeat-features",
+                "Tensor",
+                &[attr(
+                    "count",
+                    AttributeValue::Integer(i64::from(hyper.streams)),
+                )],
+                &[embedded],
+                &shape(vec![sequence_length, streams * config.hidden_size]),
+                None,
+            ),
+            None => embedded,
+        }
     } else {
         declare_input(
             "hidden_states_in",
@@ -623,28 +1268,45 @@ fn build_graph_segment(
     for layer in start_layer as u64..end_layer as u64 {
         hidden = build_layer(
             &config,
+            &variants,
             moe.as_ref(),
             layer,
             &hidden,
+            &token_ids,
             sequence_length,
             kv_append,
         );
     }
 
     if end_layer == config.num_hidden_layers {
-        let final_norm_weight = weight_edge("final_norm");
-        let hidden_final = add_node(
-            "final_norm",
-            "rmsnorm",
-            "Normalization",
-            &[attr(
-                "epsilon",
-                AttributeValue::FloatValue(config.rms_norm_eps),
-            )],
-            &[hidden, final_norm_weight],
-            &shape(vec![sequence_length, config.hidden_size]),
-            None,
-        );
+        let hidden_final = match &variants.hyper {
+            // The final mix of the streams feeds the LM head directly.
+            Some(hyper) => {
+                gated_residual(
+                    &config,
+                    &variants,
+                    hyper,
+                    "final_hyper",
+                    "final_hyper",
+                    &hidden,
+                    sequence_length,
+                    false,
+                )
+                .0
+            }
+            None => {
+                let final_norm_weight = weight_edge("final_norm");
+                add_node(
+                    "final_norm",
+                    "rmsnorm",
+                    "Normalization",
+                    &variants.norm(config.rms_norm_eps),
+                    &[hidden, final_norm_weight],
+                    &shape(vec![sequence_length, config.hidden_size]),
+                    None,
+                )
+            }
+        };
 
         let lm_head_weight = weight_edge("lm_head");
         if config.tie_word_embeddings {
