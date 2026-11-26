@@ -1,0 +1,10 @@
+schema: spec-driven
+
+context: |
+  Magnetar-component-Qwen is part of Magnetar (https://github.com/astorise/Magnetar), a Rust-first
+  local AI Runtime. A Model Component: a WebAssembly Component that describes one model family's graph
+  to the Runtime through the `magnetar:model-component-graph` contract
+  (https://github.com/astorise/magnetar-component-api), built on https://github.com/astorise/magnetar-
+  component-sdk. It never selects a Provider or a Device. Its specifications and changes live in this
+  repository. A change that also reaches the Magnetar core is coordinated by a change of the same name
+  in Magnetar, which links to the companion change here.
